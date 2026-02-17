@@ -1,5 +1,6 @@
 # ─── Go ───────────────────────────────────────────────────────────────────────
-server/static/        # React build output (embedded into Go binary)
+server/static/*       # React build output (embedded into Go binary)
+!server/static/index.html  # keep placeholder so Go embed compiles without a build
 *.exe
 *.test
 *.out

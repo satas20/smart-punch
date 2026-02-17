@@ -414,7 +414,7 @@ func wsHandler(hub *Hub) http.HandlerFunc {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
-	// UDP server
+	// UDP server — plain listen, ESP32 now pings us directly (no broadcast)
 	udpAddr, err := net.ResolveUDPAddr("udp4", udpPort)
 	if err != nil {
 		log.Fatalf("UDP resolve: %v", err)

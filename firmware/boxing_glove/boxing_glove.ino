@@ -10,6 +10,11 @@
  *   Power:   3.7V LiPo → TP4056 OUT+ → ESP32 VIN
  *
  * Library required: MPU6050_light (install via Arduino Library Manager)
+ *
+ * LED states (onboard LED, GPIO 2):
+ *   Slow blink  (500ms) → connecting to WiFi
+ *   Fast blink  (100ms) → waiting for server ACK (ping phase)
+ *   Solid ON            → paired with server, streaming
  */
 
 #include <WiFi.h>
@@ -18,24 +23,25 @@
 #include "MPU6050_light.h"
 
 // ─── Configuration ────────────────────────────────────────────────────────────
-#define WIFI_SSID       "LunaWifi"
-#define WIFI_PASS       "albay2002"
-#define UDP_PORT        4210
-#define SAMPLE_RATE_MS  10     // 10ms = 100Hz
-#define DISCOVERY_MS    2000   // Broadcast every 2s until ACK
-#define LED_PIN         2      // Onboard LED (GPIO2 on most ESP32 boards)
+#define WIFI_SSID      "LunaWifi"
+#define WIFI_PASS      "albay2002"
+#define SERVER_IP      "192.168.1.118"  // Your PC's IP on LunaWifi
+#define UDP_PORT       4210
+#define SAMPLE_RATE_MS 10               // 10ms = 100Hz
+#define PING_INTERVAL  2000             // ms between pings until ACK received
+#define LED_PIN        2                // Onboard LED
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
-WiFiUDP   udp;
-MPU6050   mpu(Wire);
+WiFiUDP  udp;
+MPU6050  mpu(Wire);
 
 IPAddress serverIP;
-bool      serverFound    = false;
-uint32_t  lastDiscovery  = 0;
-uint32_t  lastSample     = 0;
+bool      serverFound   = false;
+uint32_t  lastPing      = 0;
+uint32_t  lastSample    = 0;
+uint32_t  lastLedToggle = 0;
 
-// Incoming command buffer
-char      incomingBuf[64];
+char incomingBuf[64];
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
@@ -43,48 +49,51 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  // Connect to WiFi
+  // ── WiFi: slow blink while connecting ─────────────────────────────────────
   Serial.printf("\nConnecting to %s", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    digitalWrite(LED_PIN, HIGH); delay(500);
+    digitalWrite(LED_PIN, LOW);  delay(500);
     Serial.print(".");
   }
-  Serial.printf("\nWiFi connected. IP: %s\n", WiFi.localIP().toString().c_str());
+  digitalWrite(LED_PIN, LOW);
+  Serial.printf("\nWiFi connected. ESP32 IP: %s\n", WiFi.localIP().toString().c_str());
 
-  // Start UDP
+  // ── UDP ───────────────────────────────────────────────────────────────────
   udp.begin(UDP_PORT);
+  serverIP.fromString(SERVER_IP);
+  Serial.printf("Server target: %s:%d\n", SERVER_IP, UDP_PORT);
 
-  // Initialize I2C and MPU6050
-  Wire.begin(21, 22);  // SDA=21, SCL=22
+  // ── MPU6050 ───────────────────────────────────────────────────────────────
+  Wire.begin(21, 22);
   byte status = mpu.begin();
   if (status != 0) {
     Serial.printf("MPU6050 init failed (status %d). Check wiring.\n", status);
     while (1) { delay(1000); }
   }
-  Serial.println("MPU6050 ready. Calibrating gyro offsets...");
-
-  // Calibrate: keep device still for ~3 seconds
+  Serial.println("MPU6050 ready. Calibrating — keep device still...");
   mpu.calcOffsets(true, true);
   Serial.println("Calibration done.");
 
-  // Blink LED 3x to signal ready
+  // 3 quick blinks → ready, entering ping phase
   for (int i = 0; i < 3; i++) {
     digitalWrite(LED_PIN, HIGH); delay(100);
     digitalWrite(LED_PIN, LOW);  delay(100);
   }
 
-  Serial.println("Broadcasting for server...");
+  Serial.printf("Pinging server at %s every %dms...\n", SERVER_IP, PING_INTERVAL);
 }
 
-// ─── Discovery ────────────────────────────────────────────────────────────────
-void broadcastDiscover() {
-  udp.beginPacket(IPAddress(255, 255, 255, 255), UDP_PORT);
+// ─── Ping server (replaces broadcast) ────────────────────────────────────────
+void sendPing() {
+  udp.beginPacket(serverIP, UDP_PORT);
   udp.print("{\"type\":\"discover\"}");
   udp.endPacket();
-  Serial.println("Discovery broadcast sent.");
+  Serial.printf("Ping → %s:%d\n", SERVER_IP, UDP_PORT);
 }
 
+// ─── Check for incoming UDP commands ─────────────────────────────────────────
 void checkIncoming() {
   int packetSize = udp.parsePacket();
   if (packetSize <= 0) return;
@@ -95,53 +104,44 @@ void checkIncoming() {
 
   String msg = String(incomingBuf);
 
-  // ACK from server → lock onto its IP
+  // ACK from server → paired, go solid ON
   if (!serverFound && msg.indexOf("\"ack\"") != -1) {
-    serverIP    = udp.remoteIP();
     serverFound = true;
-    Serial.printf("Server found at %s\n", serverIP.toString().c_str());
-    // Solid LED to confirm
-    digitalWrite(LED_PIN, HIGH); delay(500); digitalWrite(LED_PIN, LOW);
+    Serial.println("Server ACK received — paired! LED solid ON. Streaming...");
+    digitalWrite(LED_PIN, HIGH);  // solid on permanently
   }
 
-  // Session reset command from server
+  // Session reset
   if (msg.indexOf("\"session_reset\"") != -1) {
-    Serial.println("Session reset command received.");
-    // Send ack back
+    Serial.println("Session reset received.");
     udp.beginPacket(serverIP, UDP_PORT);
     udp.print("{\"type\":\"session_reset_ack\"}");
     udp.endPacket();
-    // 2 quick blinks
+    // 2 quick blinks, then back solid
     for (int i = 0; i < 2; i++) {
-      digitalWrite(LED_PIN, HIGH); delay(80);
       digitalWrite(LED_PIN, LOW);  delay(80);
+      digitalWrite(LED_PIN, HIGH); delay(80);
     }
   }
 
-  // Session start command from server
+  // Session start
   if (msg.indexOf("\"session_start\"") != -1) {
-    Serial.println("Session start command received.");
-    // 1 long blink
-    digitalWrite(LED_PIN, HIGH); delay(400); digitalWrite(LED_PIN, LOW);
+    Serial.println("Session start received.");
+    // 1 long pulse, then back solid
+    digitalWrite(LED_PIN, LOW);  delay(400);
+    digitalWrite(LED_PIN, HIGH);
   }
 }
 
-// ─── Stream Sample ────────────────────────────────────────────────────────────
+// ─── Stream one sensor sample ─────────────────────────────────────────────────
 void streamSample() {
   mpu.update();
 
-  float ax = mpu.getAccX();  // m/s²  (MPU6050_light returns g by default,
-  float ay = mpu.getAccY();  //        multiply by 9.81 to get m/s²)
-  float az = mpu.getAccZ();
-
-  // Convert g → m/s²
-  ax *= 9.81f;
-  ay *= 9.81f;
-  az *= 9.81f;
-
+  float ax = mpu.getAccX() * 9.81f;  // g → m/s²
+  float ay = mpu.getAccY() * 9.81f;
+  float az = mpu.getAccZ() * 9.81f;
   uint32_t ts = millis();
 
-  // Build compact JSON packet
   char buf[96];
   snprintf(buf, sizeof(buf),
     "{\"type\":\"data\",\"ax\":%.2f,\"ay\":%.2f,\"az\":%.2f,\"ts\":%lu}",
@@ -157,17 +157,23 @@ void streamSample() {
 void loop() {
   uint32_t now = millis();
 
-  // Phase 1: Discovery (until server is found)
+  // Phase 1: Ping until server ACKs
   if (!serverFound) {
-    if (now - lastDiscovery >= DISCOVERY_MS) {
-      broadcastDiscover();
-      lastDiscovery = now;
+    // Fast blink — non-blocking
+    if (now - lastLedToggle >= 100) {
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      lastLedToggle = now;
     }
-    checkIncoming();  // Wait for ACK
-    return;           // Don't stream until server is found
+    // Send ping every PING_INTERVAL ms
+    if (now - lastPing >= PING_INTERVAL) {
+      sendPing();
+      lastPing = now;
+    }
+    checkIncoming();
+    return;
   }
 
-  // Phase 2: Streaming + incoming command handling
+  // Phase 2: Paired — stream data + listen for commands
   checkIncoming();
 
   if (now - lastSample >= SAMPLE_RATE_MS) {
