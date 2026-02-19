@@ -186,11 +186,18 @@ func (a *Analyzer) SetConnected(hand ble.Hand, connected bool) {
 	if hand == ble.RightHand {
 		state = a.right
 	}
+
+	wasConnected := state.Connected
 	state.Connected = connected
 
-	// Auto-pause if a glove disconnects during active session
-	if a.active && !connected {
+	// Pause only on a connected→disconnected transition during an active session,
+	// not simply because a glove was never connected (single-glove mode).
+	if a.active && wasConnected && !connected {
 		a.paused = true
+	}
+	// Resume automatically when the dropped glove comes back.
+	if a.active && a.paused && connected {
+		a.paused = false
 	}
 
 	a.broadcastLocked()

@@ -1,21 +1,24 @@
 import { useEffect, useRef } from 'react'
+import { TYPE_COLORS } from './PunchBreakdown'
 
 interface Props {
-  count: number
-  active: boolean
+  count:     number
+  active:    boolean
+  lastType?: string  // most recent punch type
 }
 
-export function PunchCounter({ count, active }: Props) {
+export function PunchCounter({ count, active, lastType }: Props) {
   const prevCount = useRef(count)
-  const flashRef = useRef<HTMLDivElement>(null)
+  const flashRef  = useRef<HTMLDivElement>(null)
+  const typeColor = TYPE_COLORS[lastType ?? ''] ?? '#ff4d4d'
 
   // Flash animation on new punch
   useEffect(() => {
     if (count > prevCount.current && flashRef.current) {
       const el = flashRef.current
       el.style.transition = 'none'
-      el.style.color = '#ff4d4d'
-      el.style.textShadow = '0 0 40px #ff4d4d'
+      el.style.color = typeColor
+      el.style.textShadow = `0 0 40px ${typeColor}`
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           el.style.transition = 'color 0.4s ease, text-shadow 0.4s ease'
@@ -25,16 +28,23 @@ export function PunchCounter({ count, active }: Props) {
       })
     }
     prevCount.current = count
-  }, [count])
+  }, [count, typeColor])
 
   return (
     <div style={styles.wrapper}>
       <p style={styles.label}>PUNCH COUNT</p>
+
       <div ref={flashRef} style={styles.number}>
         {count}
       </div>
-      {!active && (
-        <p style={styles.hint}>Press START to begin a session</p>
+
+      {/* Last punch type badge */}
+      {lastType ? (
+        <p style={{ ...styles.typeLabel, color: typeColor }}>
+          {lastType.toUpperCase()}
+        </p>
+      ) : (
+        !active && <p style={styles.hint}>Press START to begin a session</p>
       )}
     </div>
   )
@@ -46,7 +56,7 @@ const styles: Record<string, React.CSSProperties> = {
     flexDirection: 'column',
     alignItems: 'center',
     justifyContent: 'center',
-    padding: '32px 16px',
+    padding: '28px 16px',
     borderBottom: '1px solid #1e1e1e',
   },
   label: {
@@ -57,13 +67,20 @@ const styles: Record<string, React.CSSProperties> = {
     textTransform: 'uppercase',
   },
   number: {
-    fontSize: 'clamp(80px, 15vw, 160px)',
+    fontSize: 'clamp(72px, 14vw, 144px)',
     fontWeight: 700,
     lineHeight: 1,
     color: '#ffffff',
     textShadow: '0 0 20px rgba(255,255,255,0.15)',
     fontVariantNumeric: 'tabular-nums',
     transition: 'color 0.4s ease, text-shadow 0.4s ease',
+  },
+  typeLabel: {
+    marginTop: '10px',
+    fontSize: '14px',
+    fontWeight: 600,
+    letterSpacing: '4px',
+    transition: 'color 0.3s ease',
   },
   hint: {
     marginTop: '16px',
