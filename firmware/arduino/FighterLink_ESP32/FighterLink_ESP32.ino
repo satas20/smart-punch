@@ -74,6 +74,16 @@
 #define SAMPLE_RATE_MS          10      // 10ms = 100Hz
 #define LED_BLINK_FAST_MS       200     // Fast blink (advertising)
 #define LED_BLINK_SLOW_MS       1000    // Slow blink (initializing)
+#define LED_BLINK_CALIBRATING   500     // Medium blink (calibrating)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMART CALIBRATION CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#define STILLNESS_WINDOW_MS     3000    // Must be still for 3 seconds to calibrate
+#define STILLNESS_SAMPLES       50      // Number of samples for variance calculation
+#define STILLNESS_ACCEL_THRESH  0.15f   // Max acceleration variance (m/s²) to be "still"
+#define STILLNESS_GYRO_THRESH   5.0f    // Max gyro variance (°/s) to be "still"
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SENSOR SCALING
@@ -133,6 +143,21 @@ uint32_t lastSampleTime = 0;
 uint32_t lastLedToggle = 0;
 bool ledState = false;
 bool isCalibrated = false;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMART CALIBRATION STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Rolling buffer for variance calculation
+float accelBuffer[STILLNESS_SAMPLES][3];  // X, Y, Z
+float gyroBuffer[STILLNESS_SAMPLES][3];   // X, Y, Z
+int bufferIndex = 0;
+int bufferCount = 0;
+
+// Stillness tracking
+uint32_t stillnessStartTime = 0;
+bool wasStill = false;
+bool isCurrentlyStill = false;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BLE CALLBACKS
@@ -237,23 +262,149 @@ bool setupMPU() {
         return false;
     }
     
-    Serial.println("MPU6050: Ready. Calibrating - keep device still...");
+    Serial.println("MPU6050: Ready (uncalibrated)");
+    Serial.println("MPU6050: Hold glove still for 3 seconds to calibrate...");
     
-    // Slow blink during calibration
-    for (int i = 0; i < 6; i++) {
-        setLed(true);
-        delay(250);
-        setLed(false);
-        delay(250);
+    // NO blocking calibration - we'll auto-calibrate when still
+    isCalibrated = false;
+    
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMART CALIBRATION - Stillness Detection & Auto-Calibrate
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Calculate variance of a buffer
+float calculateVariance(float buffer[][3], int count, int axis) {
+    if (count < 2) return 999.0f;  // Not enough samples
+    
+    // Calculate mean
+    float mean = 0;
+    for (int i = 0; i < count; i++) {
+        mean += buffer[i][axis];
+    }
+    mean /= count;
+    
+    // Calculate variance
+    float variance = 0;
+    for (int i = 0; i < count; i++) {
+        float diff = buffer[i][axis] - mean;
+        variance += diff * diff;
+    }
+    variance /= count;
+    
+    return variance;
+}
+
+// Check if sensor is currently still (low variance)
+bool checkStillness() {
+    if (bufferCount < STILLNESS_SAMPLES) {
+        return false;  // Not enough samples yet
     }
     
-    // Calibrate offsets
+    // Calculate variance for each axis
+    float accelVarX = calculateVariance(accelBuffer, bufferCount, 0);
+    float accelVarY = calculateVariance(accelBuffer, bufferCount, 1);
+    float accelVarZ = calculateVariance(accelBuffer, bufferCount, 2);
+    
+    float gyroVarX = calculateVariance(gyroBuffer, bufferCount, 0);
+    float gyroVarY = calculateVariance(gyroBuffer, bufferCount, 1);
+    float gyroVarZ = calculateVariance(gyroBuffer, bufferCount, 2);
+    
+    // Max variance across all axes
+    float maxAccelVar = max(accelVarX, max(accelVarY, accelVarZ));
+    float maxGyroVar = max(gyroVarX, max(gyroVarY, gyroVarZ));
+    
+    // Check if below thresholds
+    bool still = (maxAccelVar < STILLNESS_ACCEL_THRESH * STILLNESS_ACCEL_THRESH) &&
+                 (maxGyroVar < STILLNESS_GYRO_THRESH * STILLNESS_GYRO_THRESH);
+    
+    return still;
+}
+
+// Add sample to rolling buffer
+void addSampleToBuffer(float ax, float ay, float az, float gx, float gy, float gz) {
+    accelBuffer[bufferIndex][0] = ax;
+    accelBuffer[bufferIndex][1] = ay;
+    accelBuffer[bufferIndex][2] = az;
+    
+    gyroBuffer[bufferIndex][0] = gx;
+    gyroBuffer[bufferIndex][1] = gy;
+    gyroBuffer[bufferIndex][2] = gz;
+    
+    bufferIndex = (bufferIndex + 1) % STILLNESS_SAMPLES;
+    if (bufferCount < STILLNESS_SAMPLES) {
+        bufferCount++;
+    }
+}
+
+// Run calibration
+void performCalibration() {
+    Serial.println("MPU6050: Stillness detected - calibrating...");
+    
+    // Run the MPU6050 library's calibration
     mpu.calcOffsets(true, true);
     
     isCalibrated = true;
-    Serial.println("MPU6050: Calibration complete");
     
-    return true;
+    Serial.println("MPU6050: Calibration complete!");
+    
+    // Visual feedback - quick triple blink
+    for (int i = 0; i < 3; i++) {
+        setLed(true);
+        delay(100);
+        setLed(false);
+        delay(100);
+    }
+}
+
+// Update stillness detection and trigger calibration if needed
+void updateSmartCalibration() {
+    // Skip if already calibrated
+    if (isCalibrated) {
+        return;
+    }
+    
+    // Read current sensor values
+    mpu.update();
+    
+    float ax = mpu.getAccX() * GRAVITY_MS2;
+    float ay = mpu.getAccY() * GRAVITY_MS2;
+    float az = mpu.getAccZ() * GRAVITY_MS2;
+    float gx = mpu.getGyroX();
+    float gy = mpu.getGyroY();
+    float gz = mpu.getGyroZ();
+    
+    // Add to rolling buffer
+    addSampleToBuffer(ax, ay, az, gx, gy, gz);
+    
+    // Check stillness
+    isCurrentlyStill = checkStillness();
+    
+    uint32_t now = millis();
+    
+    if (isCurrentlyStill) {
+        if (!wasStill) {
+            // Just became still
+            stillnessStartTime = now;
+            Serial.println("MPU6050: Detecting stillness...");
+        }
+        
+        // Check if still long enough
+        uint32_t stillDuration = now - stillnessStartTime;
+        if (stillDuration >= STILLNESS_WINDOW_MS) {
+            performCalibration();
+        }
+    } else {
+        if (wasStill) {
+            // Movement detected, reset
+            Serial.println("MPU6050: Movement detected, calibration reset");
+        }
+        stillnessStartTime = 0;
+    }
+    
+    wasStill = isCurrentlyStill;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -315,7 +466,7 @@ void setup() {
     pinMode(PIN_LED, OUTPUT);
     setLed(false);
     
-    // Initialize MPU6050
+    // Initialize MPU6050 (no blocking calibration)
     if (!setupMPU()) {
         Serial.println("FATAL: MPU6050 initialization failed!");
         Serial.println("Check wiring: SDA→GPIO21, SCL→GPIO22");
@@ -331,16 +482,9 @@ void setup() {
     // Initialize BLE
     setupBLE();
     
-    // Quick triple blink to indicate ready
-    for (int i = 0; i < 3; i++) {
-        setLed(true);
-        delay(100);
-        setLed(false);
-        delay(100);
-    }
-    
-    Serial.println("Setup complete - waiting for BLE connection...");
-    Serial.println("Open the Go server or use a BLE scanner app to connect.");
+    Serial.println("Setup complete - waiting for calibration...");
+    Serial.println("Hold the glove STILL for 3 seconds to calibrate.");
+    Serial.println("LED will blink medium speed until calibrated.");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -350,11 +494,22 @@ void setup() {
 void loop() {
     uint32_t now = millis();
     
+    // Always run smart calibration check (even when not connected)
+    // This allows calibration before/during BLE connection
+    static uint32_t lastCalibrationCheck = 0;
+    if (now - lastCalibrationCheck >= SAMPLE_RATE_MS) {
+        updateSmartCalibration();
+        lastCalibrationCheck = now;
+    }
+    
     // Handle connection state changes
     if (deviceConnected && !oldDeviceConnected) {
         // Just connected
-        Serial.println("Starting sensor streaming at 100Hz...");
-        setLed(true);  // Solid LED when connected
+        if (isCalibrated) {
+            Serial.println("Starting sensor streaming at 100Hz...");
+        } else {
+            Serial.println("Connected (uncalibrated) - hold still to calibrate...");
+        }
         oldDeviceConnected = true;
     }
     
@@ -372,8 +527,19 @@ void loop() {
             sendSensorData();
             lastSampleTime = now;
         }
+        
+        // LED state depends on calibration
+        if (isCalibrated) {
+            setLed(true);  // Solid LED when connected AND calibrated
+        } else {
+            blinkLed(LED_BLINK_CALIBRATING);  // Medium blink waiting for calibration
+        }
     } else {
-        // When not connected: fast blink to show advertising
-        blinkLed(LED_BLINK_FAST_MS);
+        // When not connected
+        if (isCalibrated) {
+            blinkLed(LED_BLINK_FAST_MS);  // Fast blink - ready, waiting for connection
+        } else {
+            blinkLed(LED_BLINK_CALIBRATING);  // Medium blink - needs calibration
+        }
     }
 }

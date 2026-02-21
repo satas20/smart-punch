@@ -12,6 +12,8 @@ type ScanConfig struct {
 	ScanTimeout time.Duration
 	// RetryDelay is how long to wait before retrying a failed connection
 	RetryDelay time.Duration
+	// ScanInterval is how often to check for disconnected devices (default 2s)
+	ScanInterval time.Duration
 	// AutoReconnect enables automatic reconnection on disconnect
 	AutoReconnect bool
 }
@@ -21,6 +23,7 @@ func DefaultScanConfig() ScanConfig {
 	return ScanConfig{
 		ScanTimeout:   0, // Scan forever
 		RetryDelay:    2 * time.Second,
+		ScanInterval:  2 * time.Second, // Check every 2 seconds
 		AutoReconnect: true,
 	}
 }
@@ -52,7 +55,23 @@ func (s *Scanner) Start() {
 	s.running = true
 	s.stop = make(chan struct{})
 
+	// Register disconnect handler for immediate reconnection
+	if s.config.AutoReconnect {
+		s.central.SetDisconnectHandler(s.onDisconnect)
+	}
+
 	go s.scanLoop()
+}
+
+// onDisconnect is called when a glove disconnects.
+// It triggers an immediate scan attempt instead of waiting for the next interval.
+func (s *Scanner) onDisconnect(hand Hand, deviceName string) {
+	if !s.running || !s.config.AutoReconnect {
+		return
+	}
+	log.Printf("Scanner: %s disconnected, initiating reconnection scan...", deviceName)
+	// Start scanning immediately
+	go s.checkAndScan()
 }
 
 // Stop halts the scanning loop.
@@ -66,74 +85,50 @@ func (s *Scanner) Stop() {
 }
 
 // scanLoop is the main scanning goroutine.
+// It periodically checks if any glove is disconnected and starts scanning if needed.
 func (s *Scanner) scanLoop() {
-	log.Println("Scanner: Starting scan loop")
+	log.Println("Scanner: Starting scan loop (checking every", s.config.ScanInterval, ")")
+
+	ticker := time.NewTicker(s.config.ScanInterval)
+	defer ticker.Stop()
+
+	// Do an initial check immediately
+	s.checkAndScan()
 
 	for {
 		select {
 		case <-s.stop:
 			log.Println("Scanner: Stopped")
 			return
-		default:
+		case <-ticker.C:
+			s.checkAndScan()
 		}
+	}
+}
 
-		// Check what we need
-		needLeft := !s.central.IsConnected(LeftHand)
-		needRight := !s.central.IsConnected(RightHand)
+// checkAndScan checks if any gloves need connection and starts scanning if needed.
+func (s *Scanner) checkAndScan() {
+	needLeft := !s.central.IsConnected(LeftHand)
+	needRight := !s.central.IsConnected(RightHand)
 
-		if !needLeft && !needRight {
-			// Both connected, wait a bit then check again
-			time.Sleep(time.Second)
-			continue
-		}
+	if !needLeft && !needRight {
+		// Both connected, nothing to do
+		return
+	}
 
-		if needLeft || needRight {
-			var needed []string
-			if needLeft {
-				needed = append(needed, "FighterLink_L")
-			}
-			if needRight {
-				needed = append(needed, "FighterLink_R")
-			}
-			log.Printf("Scanner: Looking for %v", needed)
-		}
+	// Build list of needed devices for logging
+	var needed []string
+	if needLeft {
+		needed = append(needed, LeftDeviceName)
+	}
+	if needRight {
+		needed = append(needed, RightDeviceName)
+	}
+	log.Printf("Scanner: Scanning for gloves (need: %v)", needed)
 
-		// Start scanning
-		if err := s.central.StartScanning(); err != nil {
-			log.Printf("Scanner: Failed to start scan: %v", err)
-			time.Sleep(s.config.RetryDelay)
-			continue
-		}
-
-		// Wait for connections or timeout
-		if s.config.ScanTimeout > 0 {
-			select {
-			case <-s.stop:
-				return
-			case <-time.After(s.config.ScanTimeout):
-				s.central.StopScanning()
-			}
-		} else {
-			// Scan indefinitely, but check periodically if we should stop
-			ticker := time.NewTicker(time.Second)
-			for {
-				select {
-				case <-s.stop:
-					ticker.Stop()
-					return
-				case <-ticker.C:
-					if s.central.BothConnected() {
-						ticker.Stop()
-						s.central.StopScanning()
-						goto connected
-					}
-				}
-			}
-		connected:
-		}
-
-		// Small delay before next iteration
-		time.Sleep(100 * time.Millisecond)
+	// Start scanning
+	if err := s.central.StartScanning(); err != nil {
+		log.Printf("Scanner: Failed to start scan: %v", err)
 	}
 }
 

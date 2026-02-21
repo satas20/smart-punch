@@ -52,18 +52,29 @@ const (
 
 // GloveConnection represents a connected glove.
 type GloveConnection struct {
-	Hand       Hand
-	Device     *bluetooth.Device
-	Address    bluetooth.Address
-	SensorChar *gatt.GattCharacteristic1
-	PropCh     chan *bluez.PropertyChanged
-	Connected  bool
-	LastSeq    uint16
-	PacketLoss float64
+	Hand           Hand
+	Name           string // Device name (e.g., "FighterLink_L")
+	Device         *bluetooth.Device
+	Address        bluetooth.Address
+	SensorChar     *gatt.GattCharacteristic1
+	PropCh         chan *bluez.PropertyChanged
+	Connected      bool
+	LastSeq        uint16
+	PacketLoss     float64
+	LastPacketTime time.Time // For packet timeout detection
 }
 
 // PacketHandler is called when a sensor packet is received.
 type PacketHandler func(hand Hand, packet *SensorPacket)
+
+// DisconnectHandler is called when a glove disconnects.
+type DisconnectHandler func(hand Hand, deviceName string)
+
+// Connection timeout constants
+const (
+	PacketTimeoutDuration   = 3 * time.Second // Assume disconnect if no packets for this long
+	ConnectionCheckInterval = 500 * time.Millisecond
+)
 
 // Central manages BLE connections to FighterLink gloves.
 type Central struct {
@@ -73,16 +84,19 @@ type Central struct {
 	leftGlove  *GloveConnection
 	rightGlove *GloveConnection
 
-	onPacket PacketHandler
-	scanning bool
-	stopScan chan struct{}
+	onPacket     PacketHandler
+	onDisconnect DisconnectHandler
+	scanning     bool
+	stopScan     chan struct{}
+	stopMonitor  chan struct{} // For stopping the connection monitor
 }
 
 // NewCentral creates a new BLE Central manager.
 func NewCentral() *Central {
 	return &Central{
-		adapter:  bluetooth.DefaultAdapter,
-		stopScan: make(chan struct{}),
+		adapter:     bluetooth.DefaultAdapter,
+		stopScan:    make(chan struct{}),
+		stopMonitor: make(chan struct{}),
 	}
 }
 
@@ -93,6 +107,13 @@ func (c *Central) SetPacketHandler(handler PacketHandler) {
 	c.onPacket = handler
 }
 
+// SetDisconnectHandler sets the callback for glove disconnection events.
+func (c *Central) SetDisconnectHandler(handler DisconnectHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onDisconnect = handler
+}
+
 // Enable initializes the BLE adapter.
 func (c *Central) Enable() error {
 	log.Println("BLE: Enabling adapter...")
@@ -100,7 +121,148 @@ func (c *Central) Enable() error {
 		return fmt.Errorf("failed to enable BLE adapter: %w", err)
 	}
 	log.Println("BLE: Adapter enabled")
+
+	// Start the connection monitor goroutine
+	go c.connectionMonitor()
+
 	return nil
+}
+
+// connectionMonitor periodically checks for packet timeouts and handles disconnections.
+func (c *Central) connectionMonitor() {
+	ticker := time.NewTicker(ConnectionCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopMonitor:
+			return
+		case <-ticker.C:
+			c.checkConnectionHealth()
+		}
+	}
+}
+
+// checkConnectionHealth checks if gloves have timed out (no packets received).
+func (c *Central) checkConnectionHealth() {
+	c.mu.RLock()
+	leftGlove := c.leftGlove
+	rightGlove := c.rightGlove
+	c.mu.RUnlock()
+
+	now := time.Now()
+
+	// Check left glove
+	if leftGlove != nil && leftGlove.Connected {
+		if !leftGlove.LastPacketTime.IsZero() && now.Sub(leftGlove.LastPacketTime) > PacketTimeoutDuration {
+			log.Printf("BLE: Packet timeout detected for %s (no data for %.1fs)", leftGlove.Name, now.Sub(leftGlove.LastPacketTime).Seconds())
+			c.markDisconnected(LeftHand)
+		}
+	}
+
+	// Check right glove
+	if rightGlove != nil && rightGlove.Connected {
+		if !rightGlove.LastPacketTime.IsZero() && now.Sub(rightGlove.LastPacketTime) > PacketTimeoutDuration {
+			log.Printf("BLE: Packet timeout detected for %s (no data for %.1fs)", rightGlove.Name, now.Sub(rightGlove.LastPacketTime).Seconds())
+			c.markDisconnected(RightHand)
+		}
+	}
+}
+
+// watchDeviceConnection monitors the BlueZ Device1.Connected property via D-Bus.
+// When the device disconnects, it calls markDisconnected.
+func (c *Central) watchDeviceConnection(addr bluetooth.Address, hand Hand, deviceName string) {
+	// Build device D-Bus path from MAC address.
+	mac := strings.ToUpper(addr.String())
+	devID := strings.ReplaceAll(mac, ":", "_")
+	devPath := dbus.ObjectPath("/org/bluez/hci0/dev_" + devID)
+
+	conn, err := dbus.ConnectSystemBus()
+	if err != nil {
+		log.Printf("BLE: Failed to connect to D-Bus for disconnect watch: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	// Subscribe to PropertiesChanged signals on this device object.
+	if err := conn.AddMatchSignal(
+		dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
+		dbus.WithMatchMember("PropertiesChanged"),
+		dbus.WithMatchObjectPath(devPath),
+	); err != nil {
+		log.Printf("BLE: Failed to add D-Bus match for disconnect watch: %v", err)
+		return
+	}
+
+	ch := make(chan *dbus.Signal, 16)
+	conn.Signal(ch)
+
+	for sig := range ch {
+		// Check if we're still supposed to be connected
+		c.mu.RLock()
+		var glove *GloveConnection
+		if hand == LeftHand {
+			glove = c.leftGlove
+		} else {
+			glove = c.rightGlove
+		}
+		stillConnected := glove != nil && glove.Connected
+		c.mu.RUnlock()
+
+		if !stillConnected {
+			// Already marked as disconnected, stop watching
+			return
+		}
+
+		if len(sig.Body) < 2 {
+			continue
+		}
+		iface, ok := sig.Body[0].(string)
+		if !ok || iface != "org.bluez.Device1" {
+			continue
+		}
+		changed, ok := sig.Body[1].(map[string]dbus.Variant)
+		if !ok {
+			continue
+		}
+
+		// Check if Connected property changed to false
+		if v, ok := changed["Connected"]; ok {
+			if connected, ok := v.Value().(bool); ok && !connected {
+				log.Printf("BLE: D-Bus reports %s disconnected", deviceName)
+				c.markDisconnected(hand)
+				return
+			}
+		}
+	}
+}
+
+// markDisconnected marks a glove as disconnected and triggers the callback.
+func (c *Central) markDisconnected(hand Hand) {
+	c.mu.Lock()
+	var glove *GloveConnection
+	if hand == LeftHand {
+		glove = c.leftGlove
+	} else {
+		glove = c.rightGlove
+	}
+
+	if glove == nil || !glove.Connected {
+		c.mu.Unlock()
+		return
+	}
+
+	deviceName := glove.Name
+	glove.Connected = false
+	handler := c.onDisconnect
+	c.mu.Unlock()
+
+	log.Printf("BLE: Connection lost with %s (%s hand) - will attempt reconnect", deviceName, hand)
+
+	// Trigger disconnect callback (which should start re-scanning)
+	if handler != nil {
+		handler(hand, deviceName)
+	}
 }
 
 // GetGlove returns the connection for a specific hand.
@@ -133,23 +295,26 @@ func (c *Central) handleNotification(hand Hand) func([]byte) {
 			return
 		}
 
-		// Track packet loss via sequence numbers
+		// Track packet loss via sequence numbers and update last packet time
 		c.mu.Lock()
 		glove := c.leftGlove
 		if hand == RightHand {
 			glove = c.rightGlove
 		}
-		if glove != nil && glove.LastSeq > 0 {
-			expected := glove.LastSeq + 1
-			if packet.Sequence != expected && packet.Sequence != 0 {
-				// Calculate packet loss (simple approximation)
-				missed := int(packet.Sequence) - int(expected)
-				if missed > 0 && missed < 100 {
-					glove.PacketLoss = float64(missed) / float64(packet.Sequence) * 100
+		if glove != nil {
+			// Update last packet time for timeout detection
+			glove.LastPacketTime = time.Now()
+
+			if glove.LastSeq > 0 {
+				expected := glove.LastSeq + 1
+				if packet.Sequence != expected && packet.Sequence != 0 {
+					// Calculate packet loss (simple approximation)
+					missed := int(packet.Sequence) - int(expected)
+					if missed > 0 && missed < 100 {
+						glove.PacketLoss = float64(missed) / float64(packet.Sequence) * 100
+					}
 				}
 			}
-		}
-		if glove != nil {
 			glove.LastSeq = packet.Sequence
 		}
 		handler := c.onPacket
@@ -404,14 +569,18 @@ func (c *Central) connectToDevice(result bluetooth.ScanResult, hand Hand) error 
 		return fmt.Errorf("StartNotify failed: %w", err)
 	}
 
+	deviceName := result.LocalName()
+
 	// Create glove connection record.
 	glove := &GloveConnection{
-		Hand:       hand,
-		Device:     device,
-		Address:    result.Address,
-		SensorChar: sensorChar,
-		PropCh:     propCh,
-		Connected:  true,
+		Hand:           hand,
+		Name:           deviceName,
+		Device:         device,
+		Address:        result.Address,
+		SensorChar:     sensorChar,
+		PropCh:         propCh,
+		Connected:      true,
+		LastPacketTime: time.Now(), // Initialize to avoid immediate timeout
 	}
 
 	// Store before launching the goroutine so handleNotification can find it.
@@ -434,9 +603,15 @@ func (c *Central) connectToDevice(result bluetooth.ScanResult, hand Hand) error 
 				notifHandler(update.Value.([]byte))
 			}
 		}
+		// Channel closed - this typically means disconnection
+		log.Printf("BLE: Property channel closed for %s - device may have disconnected", deviceName)
+		c.markDisconnected(hand)
 	}()
 
-	log.Printf("BLE: %s glove connected and streaming", hand)
+	// Start watching for device disconnection via D-Bus
+	go c.watchDeviceConnection(result.Address, hand, deviceName)
+
+	log.Printf("BLE: Connection established with %s (%s hand)", deviceName, hand)
 	return nil
 }
 

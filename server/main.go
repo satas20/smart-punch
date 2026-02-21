@@ -27,6 +27,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"boxing-analytics/analytics"
 	"boxing-analytics/ble"
 )
@@ -212,6 +214,46 @@ func sessionResetHandler(analyzer *analytics.Analyzer) http.HandlerFunc {
 	}
 }
 
+func sessionPauseHandler(analyzer *analytics.Analyzer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		analyzer.PauseSession()
+		log.Println("Session paused")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}
+}
+
+func sessionResumeHandler(analyzer *analytics.Analyzer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		analyzer.ResumeSession()
+		log.Println("Session resumed")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}
+}
+
+func sessionStopHandler(analyzer *analytics.Analyzer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		// Stop keeps the stats but marks session as inactive
+		analyzer.ResetSession() // For now, same as reset - stats are kept in frontend
+		log.Println("Session stopped")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}
+}
+
 func statusHandler(central *ble.Central) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		status := map[string]interface{}{
@@ -226,6 +268,10 @@ func statusHandler(central *ble.Central) http.HandlerFunc {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
+	// Suppress go-bluetooth library warnings (MapToStruct: invalid field detected)
+	// These are harmless warnings from the library not having all BlueZ properties mapped
+	logrus.SetLevel(logrus.ErrorLevel)
+
 	log.Println("========================================")
 	log.Println("FighterLink Boxing Analytics Server")
 	log.Println("========================================")
@@ -272,16 +318,63 @@ func main() {
 	scanner.Start()
 	log.Println("Scanning for FighterLink_L and FighterLink_R...")
 
-	// Ticker: broadcast elapsed time every second
+	// Ticker: broadcast elapsed time and log sensor data every second
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+
+		// Track previous calibration state for logging state changes
+		var leftWasCalibrated, rightWasCalibrated bool
+
 		for range ticker.C {
 			analyzer.BroadcastTick()
 
 			// Update connection status in analyzer
 			analyzer.SetConnected(ble.LeftHand, central.IsConnected(ble.LeftHand))
 			analyzer.SetConnected(ble.RightHand, central.IsConnected(ble.RightHand))
+
+			// Get current state for logging
+			state := analyzer.GetState()
+
+			// Log left hand sensor data if connected
+			if state.Left.Connected {
+				calStr := "UNCALIBRATED"
+				if state.Left.Calibrated {
+					calStr = "calibrated"
+				}
+
+				// Log calibration state change
+				if state.Left.Calibrated && !leftWasCalibrated {
+					log.Println("Sensor: FighterLink_L calibration complete!")
+				}
+				leftWasCalibrated = state.Left.Calibrated
+
+				log.Printf("Sensor [L] [%s]: Accel(%.2f, %.2f, %.2f) m/s² | Gyro(%.1f, %.1f, %.1f) °/s | Bat=%d%%",
+					calStr,
+					state.Left.CurrentAccel[0], state.Left.CurrentAccel[1], state.Left.CurrentAccel[2],
+					state.Left.CurrentGyro[0], state.Left.CurrentGyro[1], state.Left.CurrentGyro[2],
+					state.Left.Battery)
+			}
+
+			// Log right hand sensor data if connected
+			if state.Right.Connected {
+				calStr := "UNCALIBRATED"
+				if state.Right.Calibrated {
+					calStr = "calibrated"
+				}
+
+				// Log calibration state change
+				if state.Right.Calibrated && !rightWasCalibrated {
+					log.Println("Sensor: FighterLink_R calibration complete!")
+				}
+				rightWasCalibrated = state.Right.Calibrated
+
+				log.Printf("Sensor [R] [%s]: Accel(%.2f, %.2f, %.2f) m/s² | Gyro(%.1f, %.1f, %.1f) °/s | Bat=%d%%",
+					calStr,
+					state.Right.CurrentAccel[0], state.Right.CurrentAccel[1], state.Right.CurrentAccel[2],
+					state.Right.CurrentGyro[0], state.Right.CurrentGyro[1], state.Right.CurrentGyro[2],
+					state.Right.Battery)
+			}
 		}
 	}()
 
@@ -291,6 +384,9 @@ func main() {
 	mux.HandleFunc("/ws", wsHandler(hub, analyzer))
 	mux.HandleFunc("/api/session/start", sessionStartHandler(analyzer))
 	mux.HandleFunc("/api/session/reset", sessionResetHandler(analyzer))
+	mux.HandleFunc("/api/session/pause", sessionPauseHandler(analyzer))
+	mux.HandleFunc("/api/session/resume", sessionResumeHandler(analyzer))
+	mux.HandleFunc("/api/session/stop", sessionStopHandler(analyzer))
 	mux.HandleFunc("/api/status", statusHandler(central))
 
 	// Embedded React build

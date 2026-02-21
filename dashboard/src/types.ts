@@ -11,6 +11,7 @@ export interface PunchEvent {
 
 export interface HandState {
   connected: boolean
+  calibrated: boolean
   battery: number
   packet_loss: number
   punch_count: number
@@ -19,6 +20,8 @@ export interface HandState {
   avg_force: number
   ppm: number
   recent_punches: PunchEvent[]
+  current_accel: [number, number, number]  // X, Y, Z in m/s²
+  current_gyro: [number, number, number]   // X, Y, Z in °/s
 }
 
 export interface CombinedStats {
@@ -26,6 +29,8 @@ export interface CombinedStats {
   avg_force: number
   max_force: number
   ppm: number
+  pps: number              // punches per second
+  intensity_score: number  // gamified score
 }
 
 export interface SessionState {
@@ -37,8 +42,19 @@ export interface SessionState {
   paused: boolean
 }
 
+// App phase for UI routing
+export type AppPhase = 'pre' | 'live' | 'post'
+
+// Round configuration
+export interface RoundConfig {
+  durationSec: number  // round duration in seconds (default 180 = 3 min)
+  currentRound: number
+  roundStartTime: number  // timestamp when current round started
+}
+
 export const defaultHandState: HandState = {
   connected: false,
+  calibrated: false,
   battery: 0,
   packet_loss: 0,
   punch_count: 0,
@@ -47,6 +63,8 @@ export const defaultHandState: HandState = {
   avg_force: 0,
   ppm: 0,
   recent_punches: [],
+  current_accel: [0, 0, 0],
+  current_gyro: [0, 0, 0],
 }
 
 export const defaultSession: SessionState = {
@@ -54,6 +72,22 @@ export const defaultSession: SessionState = {
   elapsed_sec: 0,
   left: { ...defaultHandState },
   right: { ...defaultHandState },
-  combined: { total_punches: 0, avg_force: 0, max_force: 0, ppm: 0 },
+  combined: { total_punches: 0, avg_force: 0, max_force: 0, ppm: 0, pps: 0, intensity_score: 0 },
   paused: false,
+}
+
+// Helper: estimate battery life remaining (rough estimate: ~2 hours at 100%)
+export function estimateBatteryLife(batteryPercent: number): string {
+  const hoursRemaining = (batteryPercent / 100) * 2  // assume 2 hours at 100%
+  if (hoursRemaining < 1) {
+    return `${Math.round(hoursRemaining * 60)} min`
+  }
+  return `${hoursRemaining.toFixed(1)} hrs`
+}
+
+// Helper: format time as MM:SS
+export function formatTime(seconds: number): string {
+  const m = Math.floor(seconds / 60).toString().padStart(2, '0')
+  const s = Math.floor(seconds % 60).toString().padStart(2, '0')
+  return `${m}:${s}`
 }

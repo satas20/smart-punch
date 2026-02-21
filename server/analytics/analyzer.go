@@ -51,6 +51,7 @@ type PunchEvent struct {
 // HandState holds analytics for one hand.
 type HandState struct {
 	Connected      bool           `json:"connected"`
+	Calibrated     bool           `json:"calibrated"`
 	Battery        uint8          `json:"battery"`
 	PacketLoss     float64        `json:"packet_loss"`
 	PunchCount     int            `json:"punch_count"`
@@ -59,17 +60,22 @@ type HandState struct {
 	AvgForce       float64        `json:"avg_force"`
 	PunchesPerMin  float64        `json:"ppm"`
 	RecentPunches  []PunchEvent   `json:"recent_punches"`
-	forceSum       float64        // internal: sum of all punch forces
-	lastPunchTS    int64          // internal: last punch timestamp (device)
-	lastPunchTime  time.Time      // internal: last punch time (local)
+	// Current sensor values (for logging/debugging)
+	CurrentAccel  [3]float64 `json:"current_accel"` // X, Y, Z in m/s²
+	CurrentGyro   [3]float64 `json:"current_gyro"`  // X, Y, Z in °/s
+	forceSum      float64    // internal: sum of all punch forces
+	lastPunchTS   int64      // internal: last punch timestamp (device)
+	lastPunchTime time.Time  // internal: last punch time (local)
 }
 
 // CombinedStats holds aggregated stats from both hands.
 type CombinedStats struct {
-	TotalPunches  int     `json:"total_punches"`
-	AvgForce      float64 `json:"avg_force"`
-	MaxForce      float64 `json:"max_force"`
-	PunchesPerMin float64 `json:"ppm"`
+	TotalPunches   int     `json:"total_punches"`
+	AvgForce       float64 `json:"avg_force"`
+	MaxForce       float64 `json:"max_force"`
+	PunchesPerMin  float64 `json:"ppm"`
+	PunchesPerSec  float64 `json:"pps"`             // Real-time punch rate
+	IntensityScore int     `json:"intensity_score"` // Gamified score: (punches * avgForce) / minutes
 }
 
 // SessionState is the full state broadcast to WebSocket clients.
@@ -216,17 +222,29 @@ func (a *Analyzer) ProcessPacket(hand ble.Hand, packet *ble.SensorPacket) {
 		handName = "right"
 	}
 
-	// Update battery level
+	// Update battery and calibration status
 	state.Battery = packet.Battery
+	wasCalibrated := state.Calibrated
+	state.Calibrated = packet.IsCalibrated()
 
-	// Skip analysis if session not active or paused
-	if !a.active || a.paused {
-		return
+	// Log calibration state change
+	if !wasCalibrated && state.Calibrated {
+		// Just became calibrated
+		_ = handName // Will be used in logging from main.go
 	}
 
 	// Get acceleration and gyroscope values
 	ax, ay, az := packet.AccelMS2()
 	gx, gy, gz := packet.GyroDPS()
+
+	// Store current sensor values (for logging/dashboard)
+	state.CurrentAccel = [3]float64{ax, ay, az}
+	state.CurrentGyro = [3]float64{gx, gy, gz}
+
+	// Skip punch analysis if session not active or paused
+	if !a.active || a.paused {
+		return
+	}
 
 	// Calculate acceleration magnitude
 	mag := math.Sqrt(ax*ax + ay*ay + az*az)
@@ -343,7 +361,15 @@ func (a *Analyzer) buildStateLocked() *SessionState {
 		combined.MaxForce = math.Max(a.left.MaxForce, a.right.MaxForce)
 
 		if elapsed > 0 {
-			combined.PunchesPerMin = float64(combined.TotalPunches) / (elapsed / 60)
+			elapsedMin := elapsed / 60
+			combined.PunchesPerMin = float64(combined.TotalPunches) / elapsedMin
+			combined.PunchesPerSec = float64(combined.TotalPunches) / elapsed
+
+			// Intensity Score: (punches * avgForce) / minutes
+			// This creates a gamified "effort score" that rewards both volume and power
+			if elapsedMin > 0.1 {
+				combined.IntensityScore = int((float64(combined.TotalPunches) * combined.AvgForce) / elapsedMin)
+			}
 		}
 	}
 
@@ -369,6 +395,7 @@ func (a *Analyzer) copyHandState(h *HandState) *HandState {
 
 	return &HandState{
 		Connected:      h.Connected,
+		Calibrated:     h.Calibrated,
 		Battery:        h.Battery,
 		PacketLoss:     h.PacketLoss,
 		PunchCount:     h.PunchCount,
@@ -377,6 +404,8 @@ func (a *Analyzer) copyHandState(h *HandState) *HandState {
 		AvgForce:       h.AvgForce,
 		PunchesPerMin:  h.PunchesPerMin,
 		RecentPunches:  punches,
+		CurrentAccel:   h.CurrentAccel,
+		CurrentGyro:    h.CurrentGyro,
 	}
 }
 
