@@ -4,12 +4,13 @@
  * Arduino IDE version for ESP32 DevKit
  * 
  * BLE Peripheral that streams MPU6050 sensor data at 100Hz.
- * Automatically starts advertising on power-up.
+ * Features smart power management with light sleep idle mode.
  * 
- * Hardware: ESP32 DevKit + MPU6050
+ * Hardware: ESP32 DevKit + MPU6050 + TP4056 (LiPo charger)
  *   - MPU6050 SDA → GPIO21
  *   - MPU6050 SCL → GPIO22
  *   - Onboard LED → GPIO2
+ *   - BOOT button → GPIO0 (built-in, used for state control)
  * 
  * Setup:
  *   1. Install ESP32 board support in Arduino IDE
@@ -18,10 +19,23 @@
  *   4. Set HAND_ID below (0 = Left, 1 = Right)
  *   5. Upload
  * 
+ * Power Management (Light Sleep Idle Mode):
+ *   - On power-up: Starts BLE advertising for 60 seconds
+ *   - If no connection: Goes to IDLE mode (~1mA with light sleep)
+ *   - BOOT button press while IDLE: Starts advertising
+ *   - BOOT button press while ACTIVE: Goes to IDLE mode
+ *   - On disconnect: Tries to reconnect for 60 seconds, then goes to IDLE
+ * 
  * LED States:
- *   - Slow blink (1s): Initializing / Calibrating
- *   - Fast blink (200ms): Advertising, waiting for connection
- *   - Solid ON: Connected, streaming data
+ *   - Brief pulse every 5s: IDLE mode (low power)
+ *   - Fast blink (200ms): Advertising, looking for connection
+ *   - Slow blink (1s): Reconnecting after disconnect
+ *   - Medium blink (500ms): Connected but not calibrated
+ *   - Solid ON: Connected and calibrated, streaming data
+ * 
+ * Battery Life (150mAh):
+ *   - IDLE mode: ~150 hours (6+ days)
+ *   - Active streaming: ~1.5-2 hours
  */
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -41,6 +55,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <MPU6050_light.h>
+#include "esp_sleep.h"
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BLE CONFIGURATION
@@ -66,6 +81,7 @@
 #define PIN_SDA         21      // I2C Data (MPU6050)
 #define PIN_SCL         22      // I2C Clock (MPU6050)
 #define PIN_LED         2       // Onboard LED (active HIGH on DevKit)
+#define PIN_BOOT_BUTTON 0       // BOOT button (GPIO0, active LOW)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TIMING CONSTANTS
@@ -73,8 +89,24 @@
 
 #define SAMPLE_RATE_MS          10      // 10ms = 100Hz
 #define LED_BLINK_FAST_MS       200     // Fast blink (advertising)
-#define LED_BLINK_SLOW_MS       1000    // Slow blink (initializing)
+#define LED_BLINK_SLOW_MS       1000    // Slow blink (reconnecting)
 #define LED_BLINK_CALIBRATING   500     // Medium blink (calibrating)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POWER MANAGEMENT CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#define ADVERTISING_TIMEOUT_MS  60000   // 60 seconds to find connection
+#define RECONNECT_TIMEOUT_MS    60000   // 60 seconds to reconnect after disconnect
+#define BUTTON_DEBOUNCE_MS      50      // Button debounce time
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// IDLE MODE CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#define IDLE_PULSE_INTERVAL_MS  5000    // LED pulse every 5 seconds in idle
+#define IDLE_PULSE_DURATION_MS  50      // LED pulse duration (brief flash)
+#define IDLE_SLEEP_DURATION_US  100000  // Light sleep for 100ms (in microseconds)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SMART CALIBRATION CONSTANTS
@@ -121,6 +153,17 @@ struct __attribute__((packed)) SensorPacket {
 static_assert(sizeof(SensorPacket) == 20, "SensorPacket must be 20 bytes");
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+enum DeviceState {
+    STATE_IDLE,           // Low power idle mode (light sleep, BLE off)
+    STATE_ADVERTISING,    // Looking for BLE connection
+    STATE_CONNECTED,      // Connected and streaming data
+    STATE_RECONNECTING    // Lost connection, trying to reconnect
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // GLOBAL OBJECTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -143,6 +186,11 @@ uint32_t lastSampleTime = 0;
 uint32_t lastLedToggle = 0;
 bool ledState = false;
 bool isCalibrated = false;
+
+// Power management state
+DeviceState currentState = STATE_ADVERTISING;
+uint32_t stateStartTime = 0;
+bool wasEverConnected = false;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SMART CALIBRATION STATE
@@ -190,6 +238,120 @@ void blinkLed(uint32_t periodMs) {
         setLed(!ledState);
         lastLedToggle = now;
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POWER MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Forward declarations
+void changeState(DeviceState newState);
+void setupBLE();
+
+void enterIdleMode() {
+    Serial.println("Entering idle mode (light sleep)...");
+    Serial.println("Press BOOT button to start advertising");
+    Serial.flush();
+    
+    // Turn off LED
+    setLed(false);
+    
+    // Reset connection state BEFORE deinit to prevent stale flags
+    deviceConnected = false;
+    oldDeviceConnected = false;
+    
+    // Stop BLE to save power
+    BLEDevice::deinit(false);
+    
+    // Transition to idle state
+    changeState(STATE_IDLE);
+}
+
+// Check if button is pressed (non-blocking, for idle mode)
+bool isBootButtonPressed() {
+    return digitalRead(PIN_BOOT_BUTTON) == LOW;
+}
+
+// Wake from idle mode and reinitialize BLE
+void wakeFromIdle() {
+    Serial.println("Waking from idle mode...");
+    
+    // Wait for button release to avoid immediate re-trigger
+    while (digitalRead(PIN_BOOT_BUTTON) == LOW) {
+        setLed(true);
+        delay(50);
+        setLed(false);
+        delay(50);
+    }
+    delay(BUTTON_DEBOUNCE_MS);
+    
+    // Reset state for fresh connection
+    sequenceNumber = 0;
+    deviceConnected = false;
+    oldDeviceConnected = false;
+    
+    // Reinitialize BLE
+    setupBLE();
+    
+    // Reset calibration state (may need recalibration after idle)
+    // Keep isCalibrated as-is since MPU6050 offsets are still valid
+    
+    // Transition to advertising
+    changeState(STATE_ADVERTISING);
+    Serial.println("Now advertising - looking for connection...");
+}
+
+// Idle loop with light sleep - called repeatedly while in STATE_IDLE
+void handleIdleState() {
+    static uint32_t lastPulseTime = 0;
+    uint32_t now = millis();
+    
+    // Check for button press BEFORE sleeping
+    if (isBootButtonPressed()) {
+        delay(BUTTON_DEBOUNCE_MS);  // Debounce
+        if (isBootButtonPressed()) {
+            wakeFromIdle();
+            return;
+        }
+    }
+    
+    // Brief LED pulse every 5 seconds to show device is alive
+    if (now - lastPulseTime >= IDLE_PULSE_INTERVAL_MS) {
+        setLed(true);
+        delay(IDLE_PULSE_DURATION_MS);
+        setLed(false);
+        lastPulseTime = now;
+    }
+    
+    // Enter light sleep to save power (~1mA vs ~20mA awake)
+    // Will wake after 100ms OR on GPIO interrupt
+    esp_sleep_enable_timer_wakeup(IDLE_SLEEP_DURATION_US);
+    esp_light_sleep_start();
+    
+    // After waking from light sleep, loop continues
+}
+
+bool checkBootButtonPressed() {
+    // GPIO0 is active LOW (pressed = LOW)
+    if (digitalRead(PIN_BOOT_BUTTON) == LOW) {
+        delay(BUTTON_DEBOUNCE_MS);  // Debounce
+        if (digitalRead(PIN_BOOT_BUTTON) == LOW) {
+            // Wait for button release to avoid immediate re-trigger
+            while (digitalRead(PIN_BOOT_BUTTON) == LOW) {
+                delay(10);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void changeState(DeviceState newState) {
+    const char* stateNames[] = {"IDLE", "ADVERTISING", "CONNECTED", "RECONNECTING"};
+    Serial.printf("State: %s -> %s\n", stateNames[currentState], stateNames[newState]);
+    
+    currentState = newState;
+    stateStartTime = millis();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -451,16 +613,35 @@ void sendSensorData() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void setup() {
+    // ─── CRITICAL: Wait for BOOT button release ─────────────────────────────
+    // If GPIO0 is LOW during boot, ESP32 may enter download mode or have
+    // wake issues. Wait for button release before continuing.
+    pinMode(PIN_BOOT_BUTTON, INPUT);
+    pinMode(PIN_LED, OUTPUT);
+    
+    // Blink LED rapidly while waiting for button release (visual feedback)
+    while (digitalRead(PIN_BOOT_BUTTON) == LOW) {
+        digitalWrite(PIN_LED, HIGH);
+        delay(50);
+        digitalWrite(PIN_LED, LOW);
+        delay(50);
+    }
+    delay(100);  // Debounce after release
+    // ─────────────────────────────────────────────────────────────────────────
+    
     Serial.begin(115200);
-    delay(1000);
+    delay(500);
     
     Serial.println();
     Serial.println("========================================");
     Serial.println("FighterLink Boxing Glove Firmware");
-    Serial.println("Board: ESP32 DevKit");
+    Serial.println("Board: ESP32 DevKit (Light Sleep Mode)");
     Serial.printf("Hand: %s\n", HAND_ID == 0 ? "LEFT" : "RIGHT");
     Serial.println("========================================");
     Serial.println();
+    
+    // Initialize BOOT button as input (has external pull-up on DevKit)
+    pinMode(PIN_BOOT_BUTTON, INPUT);
     
     // Initialize LED
     pinMode(PIN_LED, OUTPUT);
@@ -482,9 +663,14 @@ void setup() {
     // Initialize BLE
     setupBLE();
     
-    Serial.println("Setup complete - waiting for calibration...");
-    Serial.println("Hold the glove STILL for 3 seconds to calibrate.");
-    Serial.println("LED will blink medium speed until calibrated.");
+    // Start in advertising state
+    changeState(STATE_ADVERTISING);
+    
+    Serial.println();
+    Serial.println("Ready! Looking for BLE connection...");
+    Serial.printf("Timeout: %d seconds (then goes to idle)\n", ADVERTISING_TIMEOUT_MS / 1000);
+    Serial.println("Press BOOT button to toggle between idle and advertising.");
+    Serial.println("Hold glove STILL for 3 seconds to calibrate.");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -494,52 +680,151 @@ void setup() {
 void loop() {
     uint32_t now = millis();
     
-    // Always run smart calibration check (even when not connected)
-    // This allows calibration before/during BLE connection
-    static uint32_t lastCalibrationCheck = 0;
-    if (now - lastCalibrationCheck >= SAMPLE_RATE_MS) {
-        updateSmartCalibration();
-        lastCalibrationCheck = now;
-    }
-    
-    // Handle connection state changes
-    if (deviceConnected && !oldDeviceConnected) {
-        // Just connected
-        if (isCalibrated) {
-            Serial.println("Starting sensor streaming at 100Hz...");
-        } else {
-            Serial.println("Connected (uncalibrated) - hold still to calibrate...");
-        }
-        oldDeviceConnected = true;
-    }
-    
-    if (!deviceConnected && oldDeviceConnected) {
-        // Just disconnected
-        Serial.println("Connection lost - restarting advertising...");
-        delay(500);
-        pServer->startAdvertising();
-        oldDeviceConnected = false;
-    }
-    
-    // When connected: stream sensor data at 100Hz
-    if (deviceConnected) {
-        if (now - lastSampleTime >= SAMPLE_RATE_MS) {
-            sendSensorData();
-            lastSampleTime = now;
+    // ─── State Machine ───────────────────────────────────────────────────────
+    switch (currentState) {
+        
+        // ─── IDLE STATE (Light Sleep) ────────────────────────────────────────
+        case STATE_IDLE: {
+            // Handle idle mode with light sleep
+            // Button press is handled inside handleIdleState()
+            handleIdleState();
+            break;
         }
         
-        // LED state depends on calibration
-        if (isCalibrated) {
-            setLed(true);  // Solid LED when connected AND calibrated
-        } else {
-            blinkLed(LED_BLINK_CALIBRATING);  // Medium blink waiting for calibration
+        // ─── ADVERTISING STATE ───────────────────────────────────────────────
+        case STATE_ADVERTISING: {
+            // Check for BOOT button - go to idle
+            if (checkBootButtonPressed()) {
+                Serial.println("BOOT button pressed - going to idle");
+                enterIdleMode();
+                break;
+            }
+            
+            // Check for connection
+            if (deviceConnected) {
+                wasEverConnected = true;
+                if (isCalibrated) {
+                    Serial.println("Connected! Starting sensor streaming at 100Hz...");
+                } else {
+                    Serial.println("Connected (uncalibrated) - hold still to calibrate...");
+                }
+                changeState(STATE_CONNECTED);
+                break;
+            }
+            
+            // Check for timeout
+            uint32_t elapsed = now - stateStartTime;
+            if (elapsed >= ADVERTISING_TIMEOUT_MS) {
+                Serial.println("Advertising timeout - no connection found");
+                enterIdleMode();
+                break;
+            }
+            
+            // LED: Fast blink while advertising
+            blinkLed(LED_BLINK_FAST_MS);
+            
+            // Smart calibration (runs while advertising)
+            static uint32_t lastCalibCheckAdv = 0;
+            if (now - lastCalibCheckAdv >= SAMPLE_RATE_MS) {
+                updateSmartCalibration();
+                lastCalibCheckAdv = now;
+            }
+            
+            // Progress indicator every 10 seconds
+            static uint32_t lastProgressPrint = 0;
+            if (now - lastProgressPrint >= 10000) {
+                uint32_t remaining = (ADVERTISING_TIMEOUT_MS - elapsed) / 1000;
+                Serial.printf("Still advertising... %d seconds remaining\n", remaining);
+                lastProgressPrint = now;
+            }
+            break;
         }
-    } else {
-        // When not connected
-        if (isCalibrated) {
-            blinkLed(LED_BLINK_FAST_MS);  // Fast blink - ready, waiting for connection
-        } else {
-            blinkLed(LED_BLINK_CALIBRATING);  // Medium blink - needs calibration
+        
+        // ─── CONNECTED STATE ─────────────────────────────────────────────────
+        case STATE_CONNECTED: {
+            // Check for BOOT button - go to idle
+            if (checkBootButtonPressed()) {
+                Serial.println("BOOT button pressed - disconnecting and going to idle");
+                enterIdleMode();
+                break;
+            }
+            
+            // Check for disconnection
+            if (!deviceConnected) {
+                Serial.println("Connection lost!");
+                Serial.printf("Attempting to reconnect for %d seconds...\n", RECONNECT_TIMEOUT_MS / 1000);
+                delay(500);
+                pServer->startAdvertising();
+                changeState(STATE_RECONNECTING);
+                break;
+            }
+            
+            // Stream sensor data at 100Hz
+            if (now - lastSampleTime >= SAMPLE_RATE_MS) {
+                sendSensorData();
+                lastSampleTime = now;
+            }
+            
+            // Smart calibration (runs while connected)
+            static uint32_t lastCalibCheckConn = 0;
+            if (now - lastCalibCheckConn >= SAMPLE_RATE_MS) {
+                updateSmartCalibration();
+                lastCalibCheckConn = now;
+            }
+            
+            // LED: Solid ON when calibrated, medium blink when not
+            if (isCalibrated) {
+                setLed(true);
+            } else {
+                blinkLed(LED_BLINK_CALIBRATING);
+            }
+            break;
         }
+        
+        // ─── RECONNECTING STATE ──────────────────────────────────────────────
+        case STATE_RECONNECTING: {
+            // Check for BOOT button - go to idle
+            if (checkBootButtonPressed()) {
+                Serial.println("BOOT button pressed - canceling reconnect, going to idle");
+                enterIdleMode();
+                break;
+            }
+            
+            // Check for reconnection
+            if (deviceConnected) {
+                Serial.println("Reconnected!");
+                changeState(STATE_CONNECTED);
+                break;
+            }
+            
+            // Check for timeout
+            uint32_t elapsed = now - stateStartTime;
+            if (elapsed >= RECONNECT_TIMEOUT_MS) {
+                Serial.println("Reconnect timeout - giving up");
+                enterIdleMode();
+                break;
+            }
+            
+            // LED: Slow blink while reconnecting (different from advertising)
+            blinkLed(LED_BLINK_SLOW_MS);
+            
+            // Progress indicator every 10 seconds
+            static uint32_t lastReconnectPrint = 0;
+            if (now - lastReconnectPrint >= 10000) {
+                uint32_t remaining = (RECONNECT_TIMEOUT_MS - elapsed) / 1000;
+                Serial.printf("Reconnecting... %d seconds remaining\n", remaining);
+                lastReconnectPrint = now;
+            }
+            break;
+        }
+        
+        default:
+            // Should never happen
+            Serial.println("ERROR: Unknown state!");
+            enterIdleMode();
+            break;
     }
+    
+    // Update oldDeviceConnected for next iteration
+    oldDeviceConnected = deviceConnected;
 }

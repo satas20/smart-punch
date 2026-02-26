@@ -21,9 +21,9 @@ type ScanConfig struct {
 // DefaultScanConfig returns sensible defaults for scanning.
 func DefaultScanConfig() ScanConfig {
 	return ScanConfig{
-		ScanTimeout:   0, // Scan forever
-		RetryDelay:    2 * time.Second,
-		ScanInterval:  2 * time.Second, // Check every 2 seconds
+		ScanTimeout:   0,               // Scan forever
+		RetryDelay:    3 * time.Second, // Wait 3s after disconnect before scanning
+		ScanInterval:  1 * time.Second, // Check every 1 second for faster reconnection
 		AutoReconnect: true,
 	}
 }
@@ -70,8 +70,12 @@ func (s *Scanner) onDisconnect(hand Hand, deviceName string) {
 		return
 	}
 	log.Printf("Scanner: %s disconnected, initiating reconnection scan...", deviceName)
-	// Start scanning immediately
-	go s.checkAndScan()
+	// Wait a moment for BlueZ to process the device removal before scanning
+	// This helps when ESP32 wakes from deep sleep and re-advertises
+	go func() {
+		time.Sleep(s.config.RetryDelay)
+		s.checkAndScan()
+	}()
 }
 
 // Stop halts the scanning loop.

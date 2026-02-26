@@ -253,15 +253,56 @@ func (c *Central) markDisconnected(hand Hand) {
 	}
 
 	deviceName := glove.Name
+	deviceAddr := glove.Address
 	glove.Connected = false
 	handler := c.onDisconnect
 	c.mu.Unlock()
 
 	log.Printf("BLE: Connection lost with %s (%s hand) - will attempt reconnect", deviceName, hand)
 
+	// Remove the device from BlueZ cache synchronously to allow fresh reconnection
+	// This is important when ESP32 wakes from deep sleep with a new BLE session
+	removeDeviceFromBlueZ(deviceAddr)
+	time.Sleep(500 * time.Millisecond) // Wait for BlueZ to process removal
+
 	// Trigger disconnect callback (which should start re-scanning)
 	if handler != nil {
 		handler(hand, deviceName)
+	}
+}
+
+// removeDeviceFromBlueZ removes a device from the BlueZ cache via D-Bus.
+// This helps with reconnection after ESP32 deep sleep wake-up, as BlueZ
+// may have stale cached state that prevents proper re-discovery.
+// It first attempts to disconnect, then removes the device from cache.
+func removeDeviceFromBlueZ(addr bluetooth.Address) {
+	mac := strings.ToUpper(addr.String())
+	devID := strings.ReplaceAll(mac, ":", "_")
+	devPath := dbus.ObjectPath("/org/bluez/hci0/dev_" + devID)
+
+	conn, err := dbus.ConnectSystemBus()
+	if err != nil {
+		log.Printf("BLE: Failed to connect to D-Bus for device removal: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	// First, try to disconnect if still connected (ignore errors)
+	devObj := conn.Object("org.bluez", devPath)
+	_ = devObj.Call("org.bluez.Device1.Disconnect", 0)
+	time.Sleep(100 * time.Millisecond)
+
+	// Call RemoveDevice on the adapter
+	adapterObj := conn.Object("org.bluez", "/org/bluez/hci0")
+	call := adapterObj.Call("org.bluez.Adapter1.RemoveDevice", 0, devPath)
+	if call.Err != nil {
+		// Only log if it's not a "does not exist" error
+		errStr := call.Err.Error()
+		if !strings.Contains(errStr, "Does Not Exist") && !strings.Contains(errStr, "DoesNotExist") {
+			log.Printf("BLE: RemoveDevice %s: %v", devPath, call.Err)
+		}
+	} else {
+		log.Printf("BLE: Removed cached device %s from BlueZ", devPath)
 	}
 }
 
@@ -531,6 +572,10 @@ func discoverGATT(addr bluetooth.Address, serviceUUIDStr, charUUIDStr string) (*
 func (c *Central) connectToDevice(result bluetooth.ScanResult, hand Hand) error {
 	log.Printf("BLE: Connecting to %s (%s)...", result.LocalName(), result.Address.String())
 
+	// Remove any stale cached device before connecting to ensure clean state
+	removeDeviceFromBlueZ(result.Address)
+	time.Sleep(300 * time.Millisecond)
+
 	device, err := c.adapter.Connect(result.Address, bluetooth.ConnectionParams{})
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
@@ -619,8 +664,10 @@ func (c *Central) connectToDevice(result bluetooth.ScanResult, hand Hand) error 
 func (c *Central) StartScanning() error {
 	c.mu.Lock()
 	if c.scanning {
+		// Already scanning - stop first to restart fresh
 		c.mu.Unlock()
-		return nil
+		c.StopScanning()
+		c.mu.Lock()
 	}
 	c.scanning = true
 	c.stopScan = make(chan struct{})
@@ -653,34 +700,32 @@ func (c *Central) StartScanning() error {
 
 			log.Printf("BLE: Found %s at %s", name, result.Address.String())
 
-			// Stop scanning temporarily to connect
+			// Stop scanning to connect
 			adapter.StopScan()
+
+			// Reset scanning flag - let scanner restart if needed
+			c.mu.Lock()
+			c.scanning = false
+			c.mu.Unlock()
 
 			if err := c.connectToDevice(result, hand); err != nil {
 				log.Printf("BLE: Failed to connect to %s: %v", name, err)
+				// Connection failed - scanner's periodic checkAndScan() will restart
+				return
 			}
 
-			// Resume scanning if we still need devices
-			if !c.BothConnected() {
-				c.mu.Lock()
-				if c.scanning {
-					c.mu.Unlock()
-					adapter.Scan(func(a *bluetooth.Adapter, r bluetooth.ScanResult) {
-						// This nested scan will be handled by the outer function logic
-					})
-				} else {
-					c.mu.Unlock()
-				}
-			} else {
-				log.Println("BLE: Both gloves connected, stopping scan")
-				c.mu.Lock()
-				c.scanning = false
-				c.mu.Unlock()
+			if c.BothConnected() {
+				log.Println("BLE: Both gloves connected")
 			}
+			// Scanner's periodic checkAndScan() will restart scan if more devices needed
 		})
 
 		if err != nil {
 			log.Printf("BLE: Scan error: %v", err)
+			// Reset scanning flag on error so scanner can retry
+			c.mu.Lock()
+			c.scanning = false
+			c.mu.Unlock()
 		}
 	}()
 
@@ -702,7 +747,6 @@ func (c *Central) StopScanning() {
 // Disconnect disconnects from a specific glove.
 func (c *Central) Disconnect(hand Hand) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	var glove *GloveConnection
 	if hand == LeftHand {
@@ -713,7 +757,16 @@ func (c *Central) Disconnect(hand Hand) error {
 		c.rightGlove = nil
 	}
 
-	if glove != nil && glove.Connected {
+	if glove == nil {
+		c.mu.Unlock()
+		return nil
+	}
+
+	deviceAddr := glove.Address
+	wasConnected := glove.Connected
+	c.mu.Unlock()
+
+	if wasConnected {
 		glove.Connected = false
 		// Stop notifications and clean up the D-Bus signal subscription.
 		if glove.SensorChar != nil {
@@ -726,6 +779,9 @@ func (c *Central) Disconnect(hand Hand) error {
 			return fmt.Errorf("failed to disconnect %s glove: %w", hand, err)
 		}
 		log.Printf("BLE: %s glove disconnected", hand)
+
+		// Remove from BlueZ cache to allow clean reconnection
+		go removeDeviceFromBlueZ(deviceAddr)
 	}
 
 	return nil
