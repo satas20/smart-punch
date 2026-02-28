@@ -3,6 +3,7 @@ package ble
 
 import (
 	"log"
+	"sync"
 	"time"
 )
 
@@ -23,7 +24,7 @@ func DefaultScanConfig() ScanConfig {
 	return ScanConfig{
 		ScanTimeout:   0,               // Scan forever
 		RetryDelay:    3 * time.Second, // Wait 3s after disconnect before scanning
-		ScanInterval:  1 * time.Second, // Check every 1 second for faster reconnection
+		ScanInterval:  3 * time.Second, // Check every 3 seconds
 		AutoReconnect: true,
 	}
 }
@@ -34,6 +35,7 @@ type Scanner struct {
 	config  ScanConfig
 	running bool
 	stop    chan struct{}
+	scanMu  sync.Mutex // Prevents concurrent scan attempts
 }
 
 // NewScanner creates a new Scanner with the given Central and config.
@@ -112,6 +114,12 @@ func (s *Scanner) scanLoop() {
 
 // checkAndScan checks if any gloves need connection and starts scanning if needed.
 func (s *Scanner) checkAndScan() {
+	// Prevent concurrent scan attempts - if another scan operation is in progress, skip
+	if !s.scanMu.TryLock() {
+		return
+	}
+	defer s.scanMu.Unlock()
+
 	needLeft := !s.central.IsConnected(LeftHand)
 	needRight := !s.central.IsConnected(RightHand)
 

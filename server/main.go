@@ -254,6 +254,41 @@ func sessionStopHandler(analyzer *analytics.Analyzer) http.HandlerFunc {
 	}
 }
 
+func recalibrateHandler(analyzer *analytics.Analyzer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Get hand from query param
+		hand := r.URL.Query().Get("hand")
+		if hand == "" {
+			http.Error(w, "Missing 'hand' query parameter (left or right)", http.StatusBadRequest)
+			return
+		}
+
+		switch hand {
+		case "left":
+			analyzer.ResetCalibration(ble.LeftHand)
+			log.Println("Recalibration started for left glove")
+		case "right":
+			analyzer.ResetCalibration(ble.RightHand)
+			log.Println("Recalibration started for right glove")
+		case "both":
+			analyzer.ResetCalibration(ble.LeftHand)
+			analyzer.ResetCalibration(ble.RightHand)
+			log.Println("Recalibration started for both gloves")
+		default:
+			http.Error(w, "Invalid hand: must be 'left', 'right', or 'both'", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"ok":true}`))
+	}
+}
+
 func statusHandler(central *ble.Central) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		status := map[string]interface{}{
@@ -387,6 +422,7 @@ func main() {
 	mux.HandleFunc("/api/session/pause", sessionPauseHandler(analyzer))
 	mux.HandleFunc("/api/session/resume", sessionResumeHandler(analyzer))
 	mux.HandleFunc("/api/session/stop", sessionStopHandler(analyzer))
+	mux.HandleFunc("/api/recalibrate", recalibrateHandler(analyzer))
 	mux.HandleFunc("/api/status", statusHandler(central))
 
 	// Embedded React build

@@ -4,13 +4,12 @@
  * Arduino IDE version for ESP32 DevKit
  * 
  * BLE Peripheral that streams MPU6050 sensor data at 100Hz.
- * Features smart power management with light sleep idle mode.
+ * PROTOTYPE MODE: Always-on, no sleep/idle mode for easier development.
  * 
  * Hardware: ESP32 DevKit + MPU6050 + TP4056 (LiPo charger)
  *   - MPU6050 SDA → GPIO21
  *   - MPU6050 SCL → GPIO22
  *   - Onboard LED → GPIO2
- *   - BOOT button → GPIO0 (built-in, used for state control)
  * 
  * Setup:
  *   1. Install ESP32 board support in Arduino IDE
@@ -19,23 +18,21 @@
  *   4. Set HAND_ID below (0 = Left, 1 = Right)
  *   5. Upload
  * 
- * Power Management (Light Sleep Idle Mode):
- *   - On power-up: Starts BLE advertising for 60 seconds
- *   - If no connection: Goes to IDLE mode (~1mA with light sleep)
- *   - BOOT button press while IDLE: Starts advertising
- *   - BOOT button press while ACTIVE: Goes to IDLE mode
- *   - On disconnect: Tries to reconnect for 60 seconds, then goes to IDLE
+ * Operation (Always-On Prototype Mode):
+ *   - On power-up: Starts BLE advertising indefinitely
+ *   - BLE stays active forever until a connection is made
+ *   - On disconnect: Automatically restarts advertising (no timeout)
+ *   - Press EN button to reset the board if needed
  * 
  * LED States:
- *   - Brief pulse every 5s: IDLE mode (low power)
  *   - Fast blink (200ms): Advertising, looking for connection
  *   - Slow blink (1s): Reconnecting after disconnect
  *   - Medium blink (500ms): Connected but not calibrated
  *   - Solid ON: Connected and calibrated, streaming data
  * 
- * Battery Life (150mAh):
- *   - IDLE mode: ~150 hours (6+ days)
- *   - Active streaming: ~1.5-2 hours
+ * Power Consumption:
+ *   - Always active: ~20-30mA (no sleep mode)
+ *   - Best used with USB power or TP4056 charger during development
  */
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -55,7 +52,6 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <MPU6050_light.h>
-#include "esp_sleep.h"
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BLE CONFIGURATION
@@ -81,7 +77,6 @@
 #define PIN_SDA         21      // I2C Data (MPU6050)
 #define PIN_SCL         22      // I2C Clock (MPU6050)
 #define PIN_LED         2       // Onboard LED (active HIGH on DevKit)
-#define PIN_BOOT_BUTTON 0       // BOOT button (GPIO0, active LOW)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TIMING CONSTANTS
@@ -91,22 +86,6 @@
 #define LED_BLINK_FAST_MS       200     // Fast blink (advertising)
 #define LED_BLINK_SLOW_MS       1000    // Slow blink (reconnecting)
 #define LED_BLINK_CALIBRATING   500     // Medium blink (calibrating)
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// POWER MANAGEMENT CONSTANTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#define ADVERTISING_TIMEOUT_MS  60000   // 60 seconds to find connection
-#define RECONNECT_TIMEOUT_MS    60000   // 60 seconds to reconnect after disconnect
-#define BUTTON_DEBOUNCE_MS      50      // Button debounce time
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// IDLE MODE CONSTANTS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-#define IDLE_PULSE_INTERVAL_MS  5000    // LED pulse every 5 seconds in idle
-#define IDLE_PULSE_DURATION_MS  50      // LED pulse duration (brief flash)
-#define IDLE_SLEEP_DURATION_US  100000  // Light sleep for 100ms (in microseconds)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SMART CALIBRATION CONSTANTS
@@ -157,7 +136,6 @@ static_assert(sizeof(SensorPacket) == 20, "SensorPacket must be 20 bytes");
 // ═══════════════════════════════════════════════════════════════════════════════
 
 enum DeviceState {
-    STATE_IDLE,           // Low power idle mode (light sleep, BLE off)
     STATE_ADVERTISING,    // Looking for BLE connection
     STATE_CONNECTED,      // Connected and streaming data
     STATE_RECONNECTING    // Lost connection, trying to reconnect
@@ -241,113 +219,11 @@ void blinkLed(uint32_t periodMs) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// POWER MANAGEMENT
+// STATE MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Forward declarations
-void changeState(DeviceState newState);
-void setupBLE();
-
-void enterIdleMode() {
-    Serial.println("Entering idle mode (light sleep)...");
-    Serial.println("Press BOOT button to start advertising");
-    Serial.flush();
-    
-    // Turn off LED
-    setLed(false);
-    
-    // Reset connection state BEFORE deinit to prevent stale flags
-    deviceConnected = false;
-    oldDeviceConnected = false;
-    
-    // Stop BLE to save power
-    BLEDevice::deinit(false);
-    
-    // Transition to idle state
-    changeState(STATE_IDLE);
-}
-
-// Check if button is pressed (non-blocking, for idle mode)
-bool isBootButtonPressed() {
-    return digitalRead(PIN_BOOT_BUTTON) == LOW;
-}
-
-// Wake from idle mode and reinitialize BLE
-void wakeFromIdle() {
-    Serial.println("Waking from idle mode...");
-    
-    // Wait for button release to avoid immediate re-trigger
-    while (digitalRead(PIN_BOOT_BUTTON) == LOW) {
-        setLed(true);
-        delay(50);
-        setLed(false);
-        delay(50);
-    }
-    delay(BUTTON_DEBOUNCE_MS);
-    
-    // Reset state for fresh connection
-    sequenceNumber = 0;
-    deviceConnected = false;
-    oldDeviceConnected = false;
-    
-    // Reinitialize BLE
-    setupBLE();
-    
-    // Reset calibration state (may need recalibration after idle)
-    // Keep isCalibrated as-is since MPU6050 offsets are still valid
-    
-    // Transition to advertising
-    changeState(STATE_ADVERTISING);
-    Serial.println("Now advertising - looking for connection...");
-}
-
-// Idle loop with light sleep - called repeatedly while in STATE_IDLE
-void handleIdleState() {
-    static uint32_t lastPulseTime = 0;
-    uint32_t now = millis();
-    
-    // Check for button press BEFORE sleeping
-    if (isBootButtonPressed()) {
-        delay(BUTTON_DEBOUNCE_MS);  // Debounce
-        if (isBootButtonPressed()) {
-            wakeFromIdle();
-            return;
-        }
-    }
-    
-    // Brief LED pulse every 5 seconds to show device is alive
-    if (now - lastPulseTime >= IDLE_PULSE_INTERVAL_MS) {
-        setLed(true);
-        delay(IDLE_PULSE_DURATION_MS);
-        setLed(false);
-        lastPulseTime = now;
-    }
-    
-    // Enter light sleep to save power (~1mA vs ~20mA awake)
-    // Will wake after 100ms OR on GPIO interrupt
-    esp_sleep_enable_timer_wakeup(IDLE_SLEEP_DURATION_US);
-    esp_light_sleep_start();
-    
-    // After waking from light sleep, loop continues
-}
-
-bool checkBootButtonPressed() {
-    // GPIO0 is active LOW (pressed = LOW)
-    if (digitalRead(PIN_BOOT_BUTTON) == LOW) {
-        delay(BUTTON_DEBOUNCE_MS);  // Debounce
-        if (digitalRead(PIN_BOOT_BUTTON) == LOW) {
-            // Wait for button release to avoid immediate re-trigger
-            while (digitalRead(PIN_BOOT_BUTTON) == LOW) {
-                delay(10);
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
 void changeState(DeviceState newState) {
-    const char* stateNames[] = {"IDLE", "ADVERTISING", "CONNECTED", "RECONNECTING"};
+    const char* stateNames[] = {"ADVERTISING", "CONNECTED", "RECONNECTING"};
     Serial.printf("State: %s -> %s\n", stateNames[currentState], stateNames[newState]);
     
     currentState = newState;
@@ -613,21 +489,9 @@ void sendSensorData() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 void setup() {
-    // ─── CRITICAL: Wait for BOOT button release ─────────────────────────────
-    // If GPIO0 is LOW during boot, ESP32 may enter download mode or have
-    // wake issues. Wait for button release before continuing.
-    pinMode(PIN_BOOT_BUTTON, INPUT);
+    // Initialize LED first for visual feedback
     pinMode(PIN_LED, OUTPUT);
-    
-    // Blink LED rapidly while waiting for button release (visual feedback)
-    while (digitalRead(PIN_BOOT_BUTTON) == LOW) {
-        digitalWrite(PIN_LED, HIGH);
-        delay(50);
-        digitalWrite(PIN_LED, LOW);
-        delay(50);
-    }
-    delay(100);  // Debounce after release
-    // ─────────────────────────────────────────────────────────────────────────
+    digitalWrite(PIN_LED, LOW);
     
     Serial.begin(115200);
     delay(500);
@@ -635,13 +499,10 @@ void setup() {
     Serial.println();
     Serial.println("========================================");
     Serial.println("FighterLink Boxing Glove Firmware");
-    Serial.println("Board: ESP32 DevKit (Light Sleep Mode)");
+    Serial.println("Board: ESP32 DevKit (Always-On Mode)");
     Serial.printf("Hand: %s\n", HAND_ID == 0 ? "LEFT" : "RIGHT");
     Serial.println("========================================");
     Serial.println();
-    
-    // Initialize BOOT button as input (has external pull-up on DevKit)
-    pinMode(PIN_BOOT_BUTTON, INPUT);
     
     // Initialize LED
     pinMode(PIN_LED, OUTPUT);
@@ -668,8 +529,8 @@ void setup() {
     
     Serial.println();
     Serial.println("Ready! Looking for BLE connection...");
-    Serial.printf("Timeout: %d seconds (then goes to idle)\n", ADVERTISING_TIMEOUT_MS / 1000);
-    Serial.println("Press BOOT button to toggle between idle and advertising.");
+    Serial.println("BLE will stay active until connected (no timeout).");
+    Serial.println("Press EN button to reset if needed.");
     Serial.println("Hold glove STILL for 3 seconds to calibrate.");
 }
 
@@ -683,23 +544,8 @@ void loop() {
     // ─── State Machine ───────────────────────────────────────────────────────
     switch (currentState) {
         
-        // ─── IDLE STATE (Light Sleep) ────────────────────────────────────────
-        case STATE_IDLE: {
-            // Handle idle mode with light sleep
-            // Button press is handled inside handleIdleState()
-            handleIdleState();
-            break;
-        }
-        
         // ─── ADVERTISING STATE ───────────────────────────────────────────────
         case STATE_ADVERTISING: {
-            // Check for BOOT button - go to idle
-            if (checkBootButtonPressed()) {
-                Serial.println("BOOT button pressed - going to idle");
-                enterIdleMode();
-                break;
-            }
-            
             // Check for connection
             if (deviceConnected) {
                 wasEverConnected = true;
@@ -709,14 +555,6 @@ void loop() {
                     Serial.println("Connected (uncalibrated) - hold still to calibrate...");
                 }
                 changeState(STATE_CONNECTED);
-                break;
-            }
-            
-            // Check for timeout
-            uint32_t elapsed = now - stateStartTime;
-            if (elapsed >= ADVERTISING_TIMEOUT_MS) {
-                Serial.println("Advertising timeout - no connection found");
-                enterIdleMode();
                 break;
             }
             
@@ -730,11 +568,10 @@ void loop() {
                 lastCalibCheckAdv = now;
             }
             
-            // Progress indicator every 10 seconds
+            // Progress indicator every 30 seconds (just to show it's alive)
             static uint32_t lastProgressPrint = 0;
-            if (now - lastProgressPrint >= 10000) {
-                uint32_t remaining = (ADVERTISING_TIMEOUT_MS - elapsed) / 1000;
-                Serial.printf("Still advertising... %d seconds remaining\n", remaining);
+            if (now - lastProgressPrint >= 30000) {
+                Serial.println("Still advertising... waiting for connection");
                 lastProgressPrint = now;
             }
             break;
@@ -742,17 +579,9 @@ void loop() {
         
         // ─── CONNECTED STATE ─────────────────────────────────────────────────
         case STATE_CONNECTED: {
-            // Check for BOOT button - go to idle
-            if (checkBootButtonPressed()) {
-                Serial.println("BOOT button pressed - disconnecting and going to idle");
-                enterIdleMode();
-                break;
-            }
-            
             // Check for disconnection
             if (!deviceConnected) {
-                Serial.println("Connection lost!");
-                Serial.printf("Attempting to reconnect for %d seconds...\n", RECONNECT_TIMEOUT_MS / 1000);
+                Serial.println("Connection lost! Restarting advertising...");
                 delay(500);
                 pServer->startAdvertising();
                 changeState(STATE_RECONNECTING);
@@ -783,13 +612,6 @@ void loop() {
         
         // ─── RECONNECTING STATE ──────────────────────────────────────────────
         case STATE_RECONNECTING: {
-            // Check for BOOT button - go to idle
-            if (checkBootButtonPressed()) {
-                Serial.println("BOOT button pressed - canceling reconnect, going to idle");
-                enterIdleMode();
-                break;
-            }
-            
             // Check for reconnection
             if (deviceConnected) {
                 Serial.println("Reconnected!");
@@ -797,31 +619,22 @@ void loop() {
                 break;
             }
             
-            // Check for timeout
-            uint32_t elapsed = now - stateStartTime;
-            if (elapsed >= RECONNECT_TIMEOUT_MS) {
-                Serial.println("Reconnect timeout - giving up");
-                enterIdleMode();
-                break;
-            }
-            
             // LED: Slow blink while reconnecting (different from advertising)
             blinkLed(LED_BLINK_SLOW_MS);
             
-            // Progress indicator every 10 seconds
+            // Progress indicator every 30 seconds
             static uint32_t lastReconnectPrint = 0;
-            if (now - lastReconnectPrint >= 10000) {
-                uint32_t remaining = (RECONNECT_TIMEOUT_MS - elapsed) / 1000;
-                Serial.printf("Reconnecting... %d seconds remaining\n", remaining);
+            if (now - lastReconnectPrint >= 30000) {
+                Serial.println("Still waiting for reconnection...");
                 lastReconnectPrint = now;
             }
             break;
         }
         
         default:
-            // Should never happen
-            Serial.println("ERROR: Unknown state!");
-            enterIdleMode();
+            // Should never happen - restart advertising
+            Serial.println("ERROR: Unknown state! Restarting advertising...");
+            changeState(STATE_ADVERTISING);
             break;
     }
     

@@ -122,6 +122,11 @@ func (c *Central) Enable() error {
 	}
 	log.Println("BLE: Adapter enabled")
 
+	// Stop any stale scans from previous runs/crashes
+	// This ensures BlueZ is in a clean state
+	c.adapter.StopScan()
+	time.Sleep(100 * time.Millisecond)
+
 	// Start the connection monitor goroutine
 	go c.connectionMonitor()
 
@@ -664,11 +669,18 @@ func (c *Central) connectToDevice(result bluetooth.ScanResult, hand Hand) error 
 func (c *Central) StartScanning() error {
 	c.mu.Lock()
 	if c.scanning {
-		// Already scanning - stop first to restart fresh
+		// Already scanning according to our flag - just return
 		c.mu.Unlock()
-		c.StopScanning()
-		c.mu.Lock()
+		return nil
 	}
+	c.mu.Unlock()
+
+	// Always try to stop any existing scan at the adapter level first
+	// This handles stale BlueZ state from previous runs/crashes
+	c.adapter.StopScan()
+	time.Sleep(100 * time.Millisecond)
+
+	c.mu.Lock()
 	c.scanning = true
 	c.stopScan = make(chan struct{})
 	c.mu.Unlock()

@@ -13,17 +13,25 @@ import (
 
 const (
 	// Punch detection thresholds
-	punchThreshold = 35.0 // m/s² - minimum acceleration for punch detection
+	punchThreshold = 25.0 // m/s² - acceleration above gravity for punch detection
 	debounceMS     = 300  // milliseconds between valid punches
 
 	// Punch classification thresholds (gyroscope-based)
-	hookGyroZThresh     = 200.0 // °/s - Z-axis rotation for hook detection
-	uppercutGyroXThresh = 150.0 // °/s - X-axis rotation for uppercut detection
-	straightGyroMax     = 150.0 // °/s - max rotation for straight punch
+	hookGyroThresh     = 200.0 // °/s - rotation around "up" axis for hook detection
+	uppercutGyroThresh = 150.0 // °/s - rotation for uppercut detection
+	straightGyroMax    = 150.0 // °/s - max rotation for straight punch
 
 	// Stats tracking
 	maxRecentPunches = 50  // punches kept in history
 	rollingBufSize   = 500 // 5 seconds at 100Hz
+
+	// Calibration constants
+	calibrationDuration   = 3.0 // seconds of stillness required
+	calibrationSampleRate = 100 // samples per second (100Hz)
+	calibrationSamples    = 300 // 3 seconds * 100Hz
+	stillnessAccelThresh  = 0.5 // m/s² - max acceleration variance to be "still"
+	stillnessGyroThresh   = 5.0 // °/s - max gyro variance to be "still"
+	calibrationBufferSize = 50  // samples for variance calculation
 )
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -61,11 +69,22 @@ type HandState struct {
 	PunchesPerMin  float64        `json:"ppm"`
 	RecentPunches  []PunchEvent   `json:"recent_punches"`
 	// Current sensor values (for logging/debugging)
-	CurrentAccel  [3]float64 `json:"current_accel"` // X, Y, Z in m/s²
-	CurrentGyro   [3]float64 `json:"current_gyro"`  // X, Y, Z in °/s
-	forceSum      float64    // internal: sum of all punch forces
-	lastPunchTS   int64      // internal: last punch timestamp (device)
-	lastPunchTime time.Time  // internal: last punch time (local)
+	CurrentAccel [3]float64 `json:"current_accel"` // X, Y, Z in m/s²
+	CurrentGyro  [3]float64 `json:"current_gyro"`  // X, Y, Z in °/s
+
+	// Calibration state
+	CalibrationProgress float64    `json:"calibration_progress"` // 0.0 to 1.0
+	GravityRef          [3]float64 `json:"gravity_ref"`          // Gravity vector in sensor frame
+	GloveOrientation    string     `json:"glove_orientation"`    // "palm_down", "palm_up", etc.
+	UpAxis              int        `json:"up_axis"`              // 0=X, 1=Y, 2=Z - which axis points up
+
+	// Internal state
+	forceSum          float64      // sum of all punch forces
+	lastPunchTS       int64        // last punch timestamp (device)
+	lastPunchTime     time.Time    // last punch time (local)
+	calibrationBuffer [][6]float64 // rolling buffer for stillness detection [ax,ay,az,gx,gy,gz]
+	stillnessCounter  int          // consecutive "still" samples
+	serverCalibrated  bool         // true when server has captured gravity reference
 }
 
 // CombinedStats holds aggregated stats from both hands.
@@ -222,16 +241,8 @@ func (a *Analyzer) ProcessPacket(hand ble.Hand, packet *ble.SensorPacket) {
 		handName = "right"
 	}
 
-	// Update battery and calibration status
+	// Update battery status
 	state.Battery = packet.Battery
-	wasCalibrated := state.Calibrated
-	state.Calibrated = packet.IsCalibrated()
-
-	// Log calibration state change
-	if !wasCalibrated && state.Calibrated {
-		// Just became calibrated
-		_ = handName // Will be used in logging from main.go
-	}
 
 	// Get acceleration and gyroscope values
 	ax, ay, az := packet.AccelMS2()
@@ -241,19 +252,68 @@ func (a *Analyzer) ProcessPacket(hand ble.Hand, packet *ble.SensorPacket) {
 	state.CurrentAccel = [3]float64{ax, ay, az}
 	state.CurrentGyro = [3]float64{gx, gy, gz}
 
+	// ─── Calibration Phase ───────────────────────────────────────────────────
+	// Add sample to calibration buffer
+	state.calibrationBuffer = append(state.calibrationBuffer, [6]float64{ax, ay, az, gx, gy, gz})
+	if len(state.calibrationBuffer) > calibrationSamples {
+		state.calibrationBuffer = state.calibrationBuffer[1:] // Keep last N samples
+	}
+
+	// Server-side calibration: detect stillness and capture gravity reference
+	if !state.serverCalibrated {
+		if isStill(state.calibrationBuffer) {
+			state.stillnessCounter++
+
+			// Update progress (0.0 to 1.0)
+			state.CalibrationProgress = float64(state.stillnessCounter) / float64(calibrationSamples)
+			if state.CalibrationProgress > 1.0 {
+				state.CalibrationProgress = 1.0
+			}
+
+			// After 3 seconds of stillness (300 samples at 100Hz)
+			if state.stillnessCounter >= calibrationSamples {
+				state.GravityRef = captureGravityReference(state.calibrationBuffer)
+				state.UpAxis, state.GloveOrientation = detectOrientation(state.GravityRef)
+				state.serverCalibrated = true
+				state.Calibrated = true
+
+				// Log calibration completion
+				_ = handName // Used in format string below
+				// log.Printf not available here, will broadcast state change
+			}
+		} else {
+			// Movement detected, reset stillness counter
+			if state.stillnessCounter > 0 {
+				state.stillnessCounter = 0
+				state.CalibrationProgress = 0
+			}
+		}
+
+		// Broadcast calibration progress
+		a.broadcastLocked()
+		return // Don't process punches until calibrated
+	}
+
+	// Update calibration status from firmware (for display)
+	state.Calibrated = state.serverCalibrated
+
+	// ─── Punch Detection Phase ───────────────────────────────────────────────
 	// Skip punch analysis if session not active or paused
 	if !a.active || a.paused {
 		return
 	}
 
-	// Calculate acceleration magnitude
-	mag := math.Sqrt(ax*ax + ay*ay + az*az)
+	// Calculate gravity-compensated acceleration magnitude
+	punchAx := ax - state.GravityRef[0]
+	punchAy := ay - state.GravityRef[1]
+	punchAz := az - state.GravityRef[2]
+	mag := math.Sqrt(punchAx*punchAx + punchAy*punchAy + punchAz*punchAz)
 
 	// Punch detection: threshold + debounce
 	timeSinceLast := int64(packet.Timestamp) - state.lastPunchTS
 	if mag > punchThreshold && timeSinceLast > debounceMS {
-		// Classify punch type based on gyroscope data
-		punchType := classifyPunch(ax, ay, az, gx, gy, gz)
+		// Classify punch type based on gyroscope data and calibrated up axis
+		punchType := classifyPunch(gx, gy, gz, state.UpAxis)
 
 		// Update stats
 		state.PunchCount++
@@ -297,31 +357,160 @@ func (a *Analyzer) ProcessPacket(hand ble.Hand, packet *ble.SensorPacket) {
 	}
 }
 
-// classifyPunch determines the punch type based on motion data.
-func classifyPunch(ax, ay, az, gx, gy, gz float64) PunchType {
-	// Get absolute values of gyroscope readings
+// classifyPunch determines the punch type based on motion data and calibration.
+func classifyPunch(gx, gy, gz float64, upAxis int) PunchType {
 	absGX := math.Abs(gx)
 	absGY := math.Abs(gy)
 	absGZ := math.Abs(gz)
 
-	// Hook: High rotation around Z-axis (horizontal spin)
-	if absGZ > hookGyroZThresh {
+	// Get rotation around the "up" axis (determined during calibration)
+	var upRotation float64
+	switch upAxis {
+	case 0: // X is up
+		upRotation = absGX
+	case 1: // Y is up
+		upRotation = absGY
+	case 2: // Z is up (most common for wrist-mounted, palm down)
+		upRotation = absGZ
+	default:
+		upRotation = absGZ // fallback
+	}
+
+	// Hook: High rotation around vertical (up) axis - horizontal spinning motion
+	if upRotation > hookGyroThresh {
 		return PunchHook
 	}
 
-	// Uppercut: High rotation around X-axis (vertical arc)
-	if absGX > uppercutGyroXThresh {
+	// Uppercut: High rotation around horizontal axes (pitch/roll)
+	// When palm is down, uppercut involves X or Y rotation
+	var horizontalRotation float64
+	switch upAxis {
+	case 0: // X is up, so Y and Z are horizontal
+		horizontalRotation = math.Max(absGY, absGZ)
+	case 1: // Y is up, so X and Z are horizontal
+		horizontalRotation = math.Max(absGX, absGZ)
+	case 2: // Z is up, so X and Y are horizontal
+		horizontalRotation = math.Max(absGX, absGY)
+	default:
+		horizontalRotation = math.Max(absGX, absGY)
+	}
+
+	if horizontalRotation > uppercutGyroThresh {
 		return PunchUppercut
 	}
 
-	// Straight: Low overall rotation
+	// Straight: Low rotation overall
 	maxRotation := math.Max(absGX, math.Max(absGY, absGZ))
 	if maxRotation < straightGyroMax {
 		return PunchStraight
 	}
 
-	// Unable to classify
 	return PunchUnknown
+}
+
+// ─── Calibration Functions ───────────────────────────────────────────────────
+
+// isStill checks if the recent samples indicate the glove is stationary
+func isStill(buffer [][6]float64) bool {
+	if len(buffer) < calibrationBufferSize {
+		return false
+	}
+
+	// Use last N samples for variance calculation
+	samples := buffer[len(buffer)-calibrationBufferSize:]
+
+	// Calculate mean for each axis
+	var meanAx, meanAy, meanAz, meanGx, meanGy, meanGz float64
+	for _, s := range samples {
+		meanAx += s[0]
+		meanAy += s[1]
+		meanAz += s[2]
+		meanGx += s[3]
+		meanGy += s[4]
+		meanGz += s[5]
+	}
+	n := float64(len(samples))
+	meanAx /= n
+	meanAy /= n
+	meanAz /= n
+	meanGx /= n
+	meanGy /= n
+	meanGz /= n
+
+	// Calculate variance
+	var varAx, varAy, varAz, varGx, varGy, varGz float64
+	for _, s := range samples {
+		varAx += (s[0] - meanAx) * (s[0] - meanAx)
+		varAy += (s[1] - meanAy) * (s[1] - meanAy)
+		varAz += (s[2] - meanAz) * (s[2] - meanAz)
+		varGx += (s[3] - meanGx) * (s[3] - meanGx)
+		varGy += (s[4] - meanGy) * (s[4] - meanGy)
+		varGz += (s[5] - meanGz) * (s[5] - meanGz)
+	}
+	varAx /= n
+	varAy /= n
+	varAz /= n
+	varGx /= n
+	varGy /= n
+	varGz /= n
+
+	// Check if variance is below threshold
+	accelVar := math.Sqrt(varAx + varAy + varAz)
+	gyroVar := math.Sqrt(varGx + varGy + varGz)
+
+	return accelVar < stillnessAccelThresh && gyroVar < stillnessGyroThresh
+}
+
+// captureGravityReference averages recent accelerometer readings to get gravity vector
+func captureGravityReference(buffer [][6]float64) [3]float64 {
+	if len(buffer) < calibrationBufferSize {
+		return [3]float64{0, 0, 9.81} // default: Z-down
+	}
+
+	samples := buffer[len(buffer)-calibrationBufferSize:]
+
+	var sumAx, sumAy, sumAz float64
+	for _, s := range samples {
+		sumAx += s[0]
+		sumAy += s[1]
+		sumAz += s[2]
+	}
+	n := float64(len(samples))
+
+	return [3]float64{sumAx / n, sumAy / n, sumAz / n}
+}
+
+// detectOrientation determines which axis points "up" based on gravity reference
+func detectOrientation(gravityRef [3]float64) (upAxis int, orientation string) {
+	absX := math.Abs(gravityRef[0])
+	absY := math.Abs(gravityRef[1])
+	absZ := math.Abs(gravityRef[2])
+
+	// Find which axis has the most gravity (points up or down)
+	if absZ >= absX && absZ >= absY {
+		upAxis = 2
+		if gravityRef[2] > 0 {
+			orientation = "palm_down" // Z+ is up, so palm faces down
+		} else {
+			orientation = "palm_up" // Z- is up, so palm faces up
+		}
+	} else if absY >= absX {
+		upAxis = 1
+		if gravityRef[1] > 0 {
+			orientation = "fingers_down"
+		} else {
+			orientation = "fingers_up"
+		}
+	} else {
+		upAxis = 0
+		if gravityRef[0] > 0 {
+			orientation = "thumb_down"
+		} else {
+			orientation = "thumb_up"
+		}
+	}
+
+	return upAxis, orientation
 }
 
 // BroadcastTick sends periodic state updates (elapsed time).
@@ -394,18 +583,22 @@ func (a *Analyzer) copyHandState(h *HandState) *HandState {
 	copy(punches, h.RecentPunches)
 
 	return &HandState{
-		Connected:      h.Connected,
-		Calibrated:     h.Calibrated,
-		Battery:        h.Battery,
-		PacketLoss:     h.PacketLoss,
-		PunchCount:     h.PunchCount,
-		PunchBreakdown: breakdown,
-		MaxForce:       h.MaxForce,
-		AvgForce:       h.AvgForce,
-		PunchesPerMin:  h.PunchesPerMin,
-		RecentPunches:  punches,
-		CurrentAccel:   h.CurrentAccel,
-		CurrentGyro:    h.CurrentGyro,
+		Connected:           h.Connected,
+		Calibrated:          h.Calibrated,
+		Battery:             h.Battery,
+		PacketLoss:          h.PacketLoss,
+		PunchCount:          h.PunchCount,
+		PunchBreakdown:      breakdown,
+		MaxForce:            h.MaxForce,
+		AvgForce:            h.AvgForce,
+		PunchesPerMin:       h.PunchesPerMin,
+		RecentPunches:       punches,
+		CurrentAccel:        h.CurrentAccel,
+		CurrentGyro:         h.CurrentGyro,
+		CalibrationProgress: h.CalibrationProgress,
+		GravityRef:          h.GravityRef,
+		GloveOrientation:    h.GloveOrientation,
+		UpAxis:              h.UpAxis,
 	}
 }
 
@@ -417,4 +610,47 @@ func (a *Analyzer) broadcastLocked() {
 		// Call handler outside of lock to prevent deadlocks
 		go a.onState(state)
 	}
+}
+
+// ResetCalibration clears calibration state for a hand, allowing re-calibration.
+func (a *Analyzer) ResetCalibration(hand ble.Hand) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	var state *HandState
+	if hand == ble.LeftHand {
+		state = a.left
+	} else {
+		state = a.right
+	}
+
+	// Reset calibration state
+	state.serverCalibrated = false
+	state.Calibrated = false
+	state.CalibrationProgress = 0
+	state.stillnessCounter = 0
+	state.calibrationBuffer = nil
+	state.GravityRef = [3]float64{0, 0, 0}
+	state.GloveOrientation = ""
+	state.UpAxis = 0
+
+	a.broadcastLocked()
+}
+
+// IsCalibrated returns whether a hand is calibrated.
+func (a *Analyzer) IsCalibrated(hand ble.Hand) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if hand == ble.LeftHand {
+		return a.left.serverCalibrated
+	}
+	return a.right.serverCalibrated
+}
+
+// AnyCalibrated returns true if at least one glove is calibrated.
+func (a *Analyzer) AnyCalibrated() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.left.serverCalibrated || a.right.serverCalibrated
 }

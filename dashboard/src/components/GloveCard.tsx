@@ -4,9 +4,23 @@ import { HandState, estimateBatteryLife } from '../types'
 interface Props {
   label: 'LEFT' | 'RIGHT'
   hand: HandState
+  onRecalibrate?: () => void
 }
 
-export function GloveCard({ label, hand }: Props) {
+// Get human-readable orientation label
+function getOrientationLabel(orientation: string): string {
+  const labels: Record<string, string> = {
+    'palm_down': 'Palm Down',
+    'palm_up': 'Palm Up',
+    'fingers_up': 'Fingers Up',
+    'fingers_down': 'Fingers Down',
+    'thumb_up': 'Thumb Up',
+    'thumb_down': 'Thumb Down',
+  }
+  return labels[orientation] || 'Unknown'
+}
+
+export function GloveCard({ label, hand, onRecalibrate }: Props) {
   const isLeft = label === 'LEFT'
   
   // Status determination
@@ -18,11 +32,19 @@ export function GloveCard({ label, hand }: Props) {
     if (hand.calibrated) {
       statusColor = '#22c55e'
       statusText = 'Ready'
-      statusSubtext = 'Calibrated and connected'
+      // Show orientation in status
+      const orientationLabel = getOrientationLabel(hand.glove_orientation)
+      statusSubtext = `Calibrated (${orientationLabel})`
     } else {
       statusColor = '#f59e0b'
       statusText = 'Calibrating...'
-      statusSubtext = 'Hold glove still for 3 seconds'
+      // Show progress countdown
+      const remainingSec = Math.ceil(3 * (1 - (hand.calibration_progress || 0)))
+      if (hand.calibration_progress > 0) {
+        statusSubtext = `Hold still... ${remainingSec}s remaining`
+      } else {
+        statusSubtext = 'Place flat on ground, palm down'
+      }
     }
   }
 
@@ -49,6 +71,28 @@ export function GloveCard({ label, hand }: Props) {
         <span style={{ ...styles.statusText, color: statusColor }}>{statusText}</span>
         <span style={styles.statusSubtext}>{statusSubtext}</span>
       </div>
+
+      {/* Calibration Progress Bar (when calibrating) */}
+      {hand.connected && !hand.calibrated && hand.calibration_progress > 0 && (
+        <div style={styles.progressSection}>
+          <div style={styles.progressBar}>
+            <div style={{
+              ...styles.progressFill,
+              width: `${(hand.calibration_progress || 0) * 100}%`,
+            }} />
+          </div>
+        </div>
+      )}
+
+      {/* Recalibrate Button (when calibrated) */}
+      {hand.connected && hand.calibrated && onRecalibrate && (
+        <button
+          onClick={onRecalibrate}
+          style={styles.recalibrateBtn}
+        >
+          Recalibrate
+        </button>
+      )}
 
       {/* Battery */}
       {hand.connected && (
@@ -140,6 +184,33 @@ const styles: Record<string, React.CSSProperties> = {
   statusSubtext: {
     fontSize: '12px',
     color: '#555',
+  },
+  progressSection: {
+    marginBottom: '16px',
+  },
+  progressBar: {
+    height: '6px',
+    background: '#1e1e1e',
+    borderRadius: '3px',
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    background: '#f59e0b',
+    borderRadius: '3px',
+    transition: 'width 0.1s ease',
+  },
+  recalibrateBtn: {
+    width: '100%',
+    padding: '8px 12px',
+    marginBottom: '16px',
+    background: 'transparent',
+    border: '1px solid #333',
+    borderRadius: '6px',
+    color: '#888',
+    fontSize: '12px',
+    cursor: 'pointer',
+    transition: 'all 0.2s ease',
   },
   batterySection: {
     marginBottom: '16px',

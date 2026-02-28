@@ -8,6 +8,7 @@ interface Props {
   roundDuration: number
   setRoundDuration: (duration: number) => void
   onStart: () => void
+  onRecalibrate: (hand: 'left' | 'right') => void
 }
 
 const ROUND_OPTIONS = [
@@ -17,7 +18,7 @@ const ROUND_OPTIONS = [
   { label: '5:00', value: 300 },
 ]
 
-export function PreTrainingView({ state, connected, roundDuration, setRoundDuration, onStart }: Props) {
+export function PreTrainingView({ state, connected, roundDuration, setRoundDuration, onStart, onRecalibrate }: Props) {
   const anyGloveConnected = state.left.connected || state.right.connected
   const bothCalibrated = 
     (!state.left.connected || state.left.calibrated) && 
@@ -52,8 +53,16 @@ export function PreTrainingView({ state, connected, roundDuration, setRoundDurat
 
       {/* Glove Cards */}
       <div style={styles.gloveContainer}>
-        <GloveCard label="LEFT" hand={state.left} />
-        <GloveCard label="RIGHT" hand={state.right} />
+        <GloveCard 
+          label="LEFT" 
+          hand={state.left} 
+          onRecalibrate={() => onRecalibrate('left')} 
+        />
+        <GloveCard 
+          label="RIGHT" 
+          hand={state.right} 
+          onRecalibrate={() => onRecalibrate('right')} 
+        />
       </div>
 
       {/* Round Duration Selector */}

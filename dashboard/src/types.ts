@@ -22,6 +22,11 @@ export interface HandState {
   recent_punches: PunchEvent[]
   current_accel: [number, number, number]  // X, Y, Z in m/s²
   current_gyro: [number, number, number]   // X, Y, Z in °/s
+  // Calibration state
+  calibration_progress: number             // 0.0 to 1.0
+  gravity_ref: [number, number, number]    // Gravity vector in sensor frame
+  glove_orientation: string                // "palm_down", "palm_up", etc.
+  up_axis: number                          // 0=X, 1=Y, 2=Z
 }
 
 export interface CombinedStats {
@@ -65,6 +70,10 @@ export const defaultHandState: HandState = {
   recent_punches: [],
   current_accel: [0, 0, 0],
   current_gyro: [0, 0, 0],
+  calibration_progress: 0,
+  gravity_ref: [0, 0, 0],
+  glove_orientation: '',
+  up_axis: 0,
 }
 
 export const defaultSession: SessionState = {
